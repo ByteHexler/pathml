@@ -3,6 +3,7 @@
 
 import torch
 from torchvision import transforms
+import torch.nn.functional as F
 import numpy as np
 import pyvips as pv
 import pandas as pd
@@ -82,7 +83,7 @@ class Slide:
 
     # If slideFilePath can be a path to a WSI (to make from scratch),
     # or a path to a .pml file (to make from a pre-existing pathml Slide saved with save())
-    def __init__(self, slideFilePath, newSlideFilePath=False, level=0, verbose=False):
+    def __init__(self, slideFilePath, level=0, newSlideFilePath=False, verbose=False):
         """Constructor method
         """
         self.__verbose = verbose
@@ -93,6 +94,7 @@ class Slide:
                 self.slideFilePath = newSlideFilePath
             else:
                 self.slideFilePath = contents['slideFilePath']
+            self.level = contents['level']
             self.tileDictionary = contents['tileDictionary']
             if "rawTissueDetectionMap" in contents:
                 self.rawTissueDetectionMap = contents['rawTissueDetectionMap']
@@ -100,13 +102,14 @@ class Slide:
                 self.annotationClassMultiPolygons = contents['annotationClassMultiPolygons']
         else: # initing from WSI file (from scratch)
             self.slideFilePath = slideFilePath
+            self.level = level
         self.slideFileName = Path(self.slideFilePath).stem
 
         try:
             if self.__verbose:
                 print(self.__verbosePrefix + "Loading " + self.slideFilePath)
             self.slide = pv.Image.new_from_file(
-                self.slideFilePath, level=level)
+                self.slideFilePath, level=self.level)
         except:
             raise FileNotFoundError('Whole-slide image could not be loaded')
         else:
@@ -166,6 +169,10 @@ class Slide:
         Example:
             pathml_slide.setTileProperties(400)
         """
+
+        if self.hasTileDictionary():
+            Warning("tileDictionary already exists")
+            return
 
         self.regionWorker = pv.Region.new(self.slide)
         self.tileOverlap = round(tileOverlap * tileSize)
@@ -266,6 +273,45 @@ class Slide:
                     inference_array = inference_array > probabilityThreshold
 
         sps.save_npz(os.path.join(folder, self.slideFileName+'.npz'), inference_array)
+
+    def readMask(self, maskPath, overwriteExistingMask=False, threshold=None):
+        # threshold: float between 0 and 1.0
+        if not self.hasTileDictionary():
+            raise PermissionError(
+                'setTileProperties must be called before readMask()')
+        if not overwriteExistingMask and 'maskLevel' in self.tileDictionary[list(self.tileDictionary.keys())[0]]:
+            raise Warning('Mask already detected. Use overwriteExistingMask to overwrite it.')
+        
+        # load mask
+        self.mask = np.asarray(Image.open(maskPath))/255
+        downsampleFactor = self.slide.width / self.mask.shape[1]
+
+        if type(threshold) in [float]:
+            thresholdIsNumeric = True
+        else:
+            thresholdIsNumeric = False
+
+        self.maskTileAddresses = []
+        for tileAddress in self.iterateTiles():
+            tileXPos = round(self.tileDictionary[tileAddress]['x'] * (1 / downsampleFactor))
+            tileYPos = round(self.tileDictionary[tileAddress]['y'] * (1 / downsampleFactor))
+            tileWidth = round(self.tileDictionary[tileAddress]['width'] * (1 / downsampleFactor))
+            tileHeight = round(self.tileDictionary[tileAddress]['height'] * (1 / downsampleFactor))
+            localTmpTile = self.mask[tileYPos:tileYPos + tileHeight, tileXPos:tileXPos + tileWidth]
+            localTmpTileMean = np.nanmean(localTmpTile)
+
+            self.tileDictionary[tileAddress].update({'maskLevel': localTmpTileMean})
+            self.tileDictionary[tileAddress].update({'mask': False})
+            if thresholdIsNumeric:
+                if localTmpTileMean > threshold:
+                    self.tileDictionary[tileAddress].update({'mask': True})
+                    self.maskTileAddresses.append(tileAddress)
+            else:
+                if localTmpTileMean > 0:
+                    self.tileDictionary[tileAddress].update({'mask': True})
+                    self.maskTileAddresses.append(tileAddress)
+
+        return True
 
     def detectForeground(self, level=4, overwriteExistingForegroundDetection=False, threshold=None):
         """A function to implement traditional foreground filtering methods on the
@@ -467,14 +513,14 @@ class Slide:
 
         if hasattr(self, 'rawTissueDetectionMap'):
             if self.hasAnnotations():
-                outputDict = {'slideFilePath': self.slideFilePath, 'tileDictionary': self.tileDictionary, 'rawTissueDetectionMap': self.rawTissueDetectionMap, 'annotationClassMultiPolygons': self.annotationClassMultiPolygons}
+                outputDict = {'slideFilePath': self.slideFilePath, 'level':self.level, 'tileDictionary': self.tileDictionary, 'rawTissueDetectionMap': self.rawTissueDetectionMap, 'annotationClassMultiPolygons': self.annotationClassMultiPolygons}
             else:
-                outputDict = {'slideFilePath': self.slideFilePath, 'tileDictionary': self.tileDictionary, 'rawTissueDetectionMap': self.rawTissueDetectionMap}
+                outputDict = {'slideFilePath': self.slideFilePath, 'level':self.level, 'tileDictionary': self.tileDictionary, 'rawTissueDetectionMap': self.rawTissueDetectionMap}
         else:
             if self.hasAnnotations():
-                outputDict = {'slideFilePath': self.slideFilePath, 'tileDictionary': self.tileDictionary, 'annotationClassMultiPolygons': self.annotationClassMultiPolygons}
+                outputDict = {'slideFilePath': self.slideFilePath, 'level':self.level, 'tileDictionary': self.tileDictionary, 'annotationClassMultiPolygons': self.annotationClassMultiPolygons}
             else:
-                outputDict = {'slideFilePath': self.slideFilePath, 'tileDictionary': self.tileDictionary}
+                outputDict = {'slideFilePath': self.slideFilePath, 'level':self.level, 'tileDictionary': self.tileDictionary}
 
         pickle.dump(outputDict, open(os.path.join(folder, id)+'.pml', 'wb'))
 
@@ -1645,7 +1691,121 @@ class Slide:
         else:
             return True
 
-    def detectTissue(self, tissueDetectionLevel=1, tissueDetectionTileSize=512, tissueDetectionTileOverlap=0, tissueDetectionUpsampleFactor=4, batchSize=20, numWorkers=16, overwriteExistingTissueDetection=False, modelStateDictPath='../pathml/pathml/models/deep-tissue-detector_densenet_state-dict.pt', architecture='densenet'):
+    def extractRandomTissueTiles(self, outputDir, slideName=False, numTilesToExtract=100, className='unannotated',
+        foregroundLevelThreshold=False, tissueLevelThreshold=False, returnTileStats=True, seed=False, extractNonTissue=False):
+        """A function to extract randomly selected tiles that don't overlap any
+        annotations into directory structure amenable to torch.utils.data.ConcatDataset
+
+        Args:
+            outputDir (str): the path to the directory where the tile directory will be stored
+            slideName (str, optional): the name of the slide to be used in the file names of the extracted tiles and masks. Default is Slide.slideFileName.
+            numTilesToExtract (int, optional): the number of random unannotated tiles to extract. Default is 50.
+            className (str, optional): the name that the "class" directory should be called. Default is "unannotated".
+            foregroundLevelThreshold (str or int or float, optional): if defined as an int, only extracts tiles with a 0-100 foregroundLevel value less or equal to than the set value (0 is a black tile, 100 is a white tile). Only includes Otsu's method-passing tiles if set to 'otsu', or triangle algorithm-passing tiles if set to 'triangle'. Default is not to filter on foreground at all.
+            tissueLevelThreshold (Bool, optional): if defined, only extracts tiles with a 0 to 1 tissueLevel probability greater than or equal to the set value. Default is False.
+            returnTileStats (Bool, optional): whether to return the 0-1 normalized sum of channel values, the sum of the squares of channel values, and the number of tiles extracted for use in global mean and variance computation. Default is True.
+            seed (int, optional): the random seed to use for reproducible anayses. Default is not to use a seed when randomly selecting tiles.
+
+        Returns:
+            dict: A dictionary containing the Slide's name, 0-1 normalized sum of channel values, the sum of the squares of channel values, and the number of tiles extracted for use in global mean and variance computation; if returnTileStats is set to False, True will be returned
+
+        Example:
+            channel_data = pathml_slide.extractRandomUnannotatedTiles('/path/to/directory', numTilesToExtract=200, unannotatedClassName="non_metastasis", tissueLevelThreshold=0.995)
+        """
+
+        print("Extracting tiles from {}...".format(self.slideFileName))
+
+        if not self.hasTileDictionary():
+            raise PermissionError(
+                'setTileProperties must be called before extracting tiles')
+
+        if seed:
+            if type(seed) != int:
+                raise ValueError('Seed must be an integer')
+            random.seed(seed)
+
+        # get case ID
+        if slideName:
+            if type(slideName) != str:
+                raise ValueError("slideName must be a string")
+            else:
+                id = slideName
+        else:
+            id = self.slideFileName
+
+        if tissueLevelThreshold:
+            if ((type(tissueLevelThreshold) != int) and (type(tissueLevelThreshold) != float)) or ((tissueLevelThreshold <= 0) or (tissueLevelThreshold > 1)):
+                raise ValueError('tissueLevelThreshold must be a number greater than zero and less than or equal to 1')
+        if (type(numTilesToExtract) != int) or (numTilesToExtract <= 0):
+            raise ValueError('numTilesToExtract must be a integer greater than 0')
+
+        # Collect all unannotated tiles
+        unannotatedTileAddresses = []
+
+        unannotatedTileAddresses = self.suitableTileAddresses(tissueLevelThreshold=tissueLevelThreshold, foregroundLevelThreshold=foregroundLevelThreshold)
+
+        if len(unannotatedTileAddresses) == 0:
+            print('Warning: 0 unannotated tiles found; making no tile directories and returning zeroes')
+        if len(unannotatedTileAddresses) < numTilesToExtract:
+            print('Warning: '+str(len(unannotatedTileAddresses))+' unannotated tiles found but requested '+str(numTilesToExtract)+' tiles to extract. Extracting all suitable tiles...')
+            unannotatedTilesToExtract = unannotatedTileAddresses
+        else:
+            unannotatedTilesToExtract = random.sample(unannotatedTileAddresses, numTilesToExtract)
+
+        # Create empty class tile directories
+        if len(unannotatedTileAddresses) > 0:
+            try:
+                os.makedirs(os.path.join(outputDir, className, id), exist_ok=True)
+            except:
+                raise ValueError(os.path.join(outputDir, className, id)+' is not a valid path')
+
+        # Extract the desired number of unannotated tiles
+        channel_sums = np.zeros(3)
+        channel_squared_sums = np.zeros(3)
+        tileCounter = 0
+        normalize_to_1max = transforms.Compose([transforms.ToTensor()])
+
+        #print("Tiles to extract:", unannotatedTilesToExtract)
+        for tl in unannotatedTilesToExtract:
+            area = self.getTile(tl)
+            if (tissueLevelThreshold) and (foregroundLevelThreshold):
+                area.write_to_file(os.path.join(outputDir, className, id, 
+                    id+'_'+className+'_'+str(self.tileDictionary[tl]['x'])+'x_'+str(self.tileDictionary[tl]['y'])+'y'+'_'+str(self.tileDictionary[tl]['height'])+'tilesize_'+str(int(round(self.tileDictionary[tl]['tissueLevel']*1000)))+'tissueLevel_'+str(int(round(self.tileDictionary[tl]['foregroundLevel'])))+'foregroundLevel.jpg'), Q=100)
+            elif (tissueLevelThreshold) and (not foregroundLevelThreshold):
+                area.write_to_file(os.path.join(outputDir, className, id,
+                    id+'_'+className+'_'+str(self.tileDictionary[tl]['x'])+'x_'+str(self.tileDictionary[tl]['y'])+'y'+'_'+str(self.tileDictionary[tl]['height'])+'tilesize_'+str(int(round(self.tileDictionary[tl]['tissueLevel']*1000)))+'tissueLevel.jpg'), Q=100)
+            elif (not tissueLevelThreshold) and (foregroundLevelThreshold):
+                area.write_to_file(os.path.join(outputDir, className, id,
+                    id+'_'+className+'_'+str(self.tileDictionary[tl]['x'])+'x_'+str(self.tileDictionary[tl]['y'])+'y'+'_'+str(self.tileDictionary[tl]['height'])+'tilesize_'+str(int(round(self.tileDictionary[tl]['foregroundLevel'])))+'foregroundLevel.jpg'), Q=100)
+            else:
+                area.write_to_file(os.path.join(outputDir, className, id,
+                    id+'_'+className+'_'+str(self.tileDictionary[tl]['x'])+'x_'+str(self.tileDictionary[tl]['y'])+'y'+'_'+str(self.tileDictionary[tl]['height'])+'tilesize.jpg'), Q=100)
+
+            tileCounter = tileCounter + 1
+            if returnTileStats:
+                nparea = self.getTile(tl, writeToNumpy=True)[...,:3] # remove transparency channel
+                nparea = normalize_to_1max(nparea).numpy() # normalize values from 0-255 to 0-1
+                local_channel_sums = np.sum(nparea, axis=(1,2))
+                local_channel_squared_sums = np.sum(np.square(nparea), axis=(1,2))
+
+                channel_sums = np.add(channel_sums, local_channel_sums)
+                channel_squared_sums = np.add(channel_squared_sums, local_channel_squared_sums)
+
+        if returnTileStats:
+            if slideName:
+                return {'slide': slideName,
+                        'channel_sums': channel_sums,#np.mean(channel_means_across_tiles, axis=0).tolist(),
+                        'channel_squared_sums': channel_squared_sums,#np.mean(channel_stds_across_tiles, axis=0).tolist(),
+                        'num_tiles': tileCounter}
+            else:
+                return {'slide': self.slideFileName,
+                        'channel_sums': channel_sums,#np.mean(channel_means_across_tiles, axis=0).tolist(),
+                        'channel_squared_sums': channel_squared_sums,#np.mean(channel_stds_across_tiles, axis=0).tolist(),
+                        'num_tiles': tileCounter}
+        else:
+            return True
+
+    def detectTissue(self, tissueDetectionLevel=1, tissueDetectionTileSize=512, tissueDetectionTileOverlap=0, tissueDetectionUpsampleFactor=1, batchSize=20, numWorkers=16, overwriteExistingTissueDetection=False, modelStateDictPath='../pathml/pathml/models/deep-tissue-detector_densenet_state-dict.pt', architecture='densenet'):
         """A function to apply PathML's built-in deep tissue detector to assign
         artifact, background, and tissue probabilities that sum to one to each tile
         in the tile dictionary. The raw tissue detection map for a WSI is saved into
@@ -1680,8 +1840,13 @@ class Slide:
             print("Inferring tissue detection model using CPU")
 
         print("Detecting tissue of "+self.slideFilePath)
-        tissueForegroundSlide = Slide(self.slideFilePath, level=tissueDetectionLevel).setTileProperties(tileSize=tissueDetectionTileSize, tileOverlap=tissueDetectionTileOverlap) # tile size and overlap for tissue detector, not final tiles
-        tmpProcessor = Processor(tissueForegroundSlide)
+
+        if tissueDetectionLevel==self.level & tissueDetectionTileSize==self.tileSize & tissueDetectionTileOverlap==self.tileOverlap:
+            # don't create new Slide object if same level and tile properties
+            tmpProcessor = Processor(self)
+        else:
+            tissueForegroundSlide = Slide(self.slideFilePath, level=tissueDetectionLevel).setTileProperties(tileSize=tissueDetectionTileSize, tileOverlap=tissueDetectionTileOverlap) # tile size and overlap for tissue detector, not final tiles
+            tmpProcessor = Processor(tissueForegroundSlide)
         tissueForegroundTmp = tmpProcessor.applyModel(tissueDetector(modelStateDictPath=modelStateDictPath, architecture=architecture), batch_size=batchSize, predictionKey='tissue_detector', numWorkers=numWorkers).adoptKeyFromTileDictionary(upsampleFactor=tissueDetectionUpsampleFactor)
 
         predictionMap = np.zeros([tissueForegroundTmp.numTilesInY, tissueForegroundTmp.numTilesInX,3])
@@ -1729,6 +1894,43 @@ class Slide:
             self.tileDictionary[address].update({'backgroundLevel': predictionMap1res[address[1], address[0]][1]})
             self.tileDictionary[address].update({'tissueLevel': predictionMap1res[address[1], address[0]][2]})
 
+    def visualizePatchExtraction(self, level=3, fileName=False, folder=os.getcwd(), tissueLevelThreshold=False, foregroundLevelThreshold=False, maskLevelThreshold=False):
+        
+        if not self.hasTileDictionary():
+            raise PermissionError('setTileProperties must be called before saving self')
+
+        # get case ID
+        if fileName:
+            if type(fileName) == str:
+                id = fileName
+            else:
+                raise ValueError('fileName must be a string')
+        else:
+            id = self.slideFileName
+        
+        suitableTiles = self.suitableTileAddresses(tissueLevelThreshold, foregroundLevelThreshold, maskLevelThreshold)
+
+        thumb = self.thumbnail(level=level)
+        suitableTileMask = np.zeros((self.numTilesInY, self.numTilesInX))
+        
+        for x,y in suitableTiles:
+            suitableTileMask[y,x] = 1.0
+        
+        mask = resize(suitableTileMask, thumb.shape[:2], order=0, anti_aliasing=False)
+        mask = np.ma.masked_where(mask == 1.0, 1-mask)
+        plt.figure()
+        plt.imshow(thumb, interpolation='none')
+        plt.imshow(mask, cmap='RdYlGn', alpha=0.44, interpolation='none')
+        plt.title(id+"\nsuitable Patches")
+        if folder:
+            os.makedirs(os.path.join(folder, id), exist_ok=True)
+            plt.savefig(os.path.join(folder, id, id+"_suitable_patches.png"))
+            plt.show(block=False)
+        plt.show(block=False)
+        
+
+
+
     def visualizeTissueDetection(self, fileName=False, folder=os.getcwd()):
         """A function to generate a 3-color tissue detection map showing where
         on a WSI the deep tissue detector applied with :meth:`Slide.detectTissue() <pathml.slide.Slide.detectTissue>` artifact
@@ -1769,7 +1971,7 @@ class Slide:
         else:
             plt.show(block=False)
 
-    def inferClassifier(self, trainedModel, classNames, dataTransforms=None, batchSize=30, numWorkers=16, foregroundLevelThreshold=False, tissueLevelThreshold=False, overwriteExistingClassifications=False):
+    def inferClassifier(self, trainedModel, classNames, dataTransforms=None, batchSize=30, numWorkers=16, foregroundLevelThreshold=False, tissueLevelThreshold=False, maskLevelThreshold=False, overwriteExistingClassifications=False):
         """A function to infer a trained classifier on a Slide object using
         PyTorch.
 
@@ -1793,6 +1995,9 @@ class Slide:
         if foregroundLevelThreshold:
             if 'foregroundLevel' not in self.tileDictionary[list(self.tileDictionary.keys())[0]]:
                 raise PermissionError('Foreground detection must be performed with detectForeground() before tissueLevelThreshold can be defined')
+        if maskLevelThreshold:
+            if 'maskLevel' not in self.tileDictionary[list(self.tileDictionary.keys())[0]]:
+                raise PermissionError('Mask must be defined with readMask() before maskLevelThreshold can be defined')
         if type(classNames) != list:
             raise ValueError('classes must be a list if defined')
 
@@ -1801,12 +2006,13 @@ class Slide:
         else:
             print("Inferring model on CPU")
 
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        trainedModel.to(device)
-        trainedModel.eval()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.device_count() > 1:
+            trainedModel = torch.nn.DataParallel(trainedModel)
+        trainedModel.to(device).eval()
 
         pathSlideDataset = WholeSlideImageDataset(self, tissueLevelThreshold=tissueLevelThreshold,
-            foregroundLevelThreshold=foregroundLevelThreshold, transform=dataTransforms)
+            foregroundLevelThreshold=foregroundLevelThreshold, maskLevelThreshold=maskLevelThreshold, transform=dataTransforms)
 
         if 'classifierInferencePrediction' in self.tileDictionary[pathSlideDataset.suitableTileAddresses[0]]:
             if not overwriteExistingClassifications:
@@ -1838,7 +2044,7 @@ class Slide:
         else:
             raise Warning('No suitable tiles found at current tissueLevelThreshold and foregroundLevelThreshold')
 
-    def inferSegmenter(self, trainedModel, classNames, dataTransforms=None, dtype='int', batchSize=1, numWorkers=16, foregroundLevelThreshold=False, tissueLevelThreshold=False, overwriteExistingSegmentations=False):#, saveInChunksAtFolder=False):
+    def inferSegmenter(self, trainedModel, classNames, dataTransforms=None, dtype='int', batchSize=1, numWorkers=16, foregroundLevelThreshold=False, tissueLevelThreshold=False, maskLevelThreshold=False, overwriteExistingSegmentations=False):#, saveInChunksAtFolder=False):
         """A function to infer a trained segmentation model on a Slide object using
         PyTorch.
 
@@ -1866,6 +2072,9 @@ class Slide:
         if foregroundLevelThreshold:
             if 'foregroundLevel' not in self.tileDictionary[list(self.tileDictionary.keys())[0]]:
                 raise PermissionError('Foreground detection must be performed with detectForeground() before tissueLevelThreshold can be defined')
+        if maskLevelThreshold:
+            if 'maskLevel' not in self.tileDictionary[list(self.tileDictionary.keys())[0]]:
+                raise PermissionError('Mask must be defined with readMask() before maskLevelThreshold can be defined')
         if type(classNames) != list:
             raise ValueError('classes must be a list if defined')
 
@@ -1874,15 +2083,16 @@ class Slide:
         else:
             print("Inferring model on CPU")
 
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        trainedModel.to(device)
-        trainedModel.eval()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.device_count() > 1:
+            trainedModel = torch.nn.DataParallel(trainedModel)
+        trainedModel.to(device).eval()
 
         if trainedModel.n_classes != len(classNames):
             raise ValueError('Model has '+str(trainedModel.n_classes)+' classes but only '+str(len(classNames))+' class names were provided in the classes argument')
 
         pathSlideDataset = WholeSlideImageDataset(self, tissueLevelThreshold=tissueLevelThreshold,
-            foregroundLevelThreshold=foregroundLevelThreshold, transform=dataTransforms, segmenting=True)
+            foregroundLevelThreshold=foregroundLevelThreshold, maskLevelThreshold=maskLevelThreshold, transform=dataTransforms, segmenting=True)
 
         if 'segmenterInferencePrediction' in self.tileDictionary[pathSlideDataset.suitableTileAddresses[0]]:
             if not overwriteExistingSegmentations:
@@ -1899,7 +2109,7 @@ class Slide:
             output = output.to(device)
 
             if trainedModel.n_classes > 1:
-                batch_probs = F.softmax(output, dim=1)
+                batch_probs = torch.sigmoid(output) # F.softmax(output, dim=1) #vllt Problem 
             else:
                 batch_probs = torch.sigmoid(output)
 
@@ -1911,10 +2121,12 @@ class Slide:
 
                 tile_probs = tile_probs.squeeze(0)
 
+                def resize(x):
+                    return F.interpolate(x, pathSlideDataset.tileSize)
+
                 tf = transforms.Compose([
-                    transforms.ToPILImage(),
-                    transforms.Resize(pathSlideDataset.tileSize),
-                    transforms.ToTensor() # converts from HWC to CWH and divides by 255
+                    #transforms.ToTensor(), # converts from HWC to CWH and divides by 255
+                    transforms.Lambda(resize)
                 ])
 
                 tile_probs = tf(tile_probs.cpu())
@@ -1937,7 +2149,7 @@ class Slide:
                     else:
                         raise ValueError("'dtype' must be 'float' or 'int'")
                 else: # multiple output classes
-                    for class_index in len(classNames):
+                    for class_index in range(len(classNames)):
                         if dtype == 'int':
                             segmentation_masks[classNames[class_index]] = (full_mask[class_index,...] * 255).astype(np.uint8)
                         elif dtype == 'float':
@@ -1987,7 +2199,7 @@ class Slide:
 
         return dice_coeff(binarized_prediction_mask, ground_truth_mask).item()
 
-    def suitableTileAddresses(self, tissueLevelThreshold=False, foregroundLevelThreshold=False):
+    def suitableTileAddresses(self, tissueLevelThreshold=False, foregroundLevelThreshold=False, maskLevelThreshold=False):
         """A function that returns a list of the tile address tuples that meet
         set tissue and foreground thresholds. All addresses will be returned if
         neither tissueLevelThreshold nor foregroundLevelThreshold is defined.
@@ -2016,36 +2228,119 @@ class Slide:
                 raise PermissionError('Tissue detection must be performed with detectTissue() before tissueLevelThreshold can be defined.')
             if type(tissueLevelThreshold) not in [int, float]:
                 raise ValueError("tissueLevelThreshold must be an int or float")
+        if maskLevelThreshold:
+            if 'maskLevel' not in self.tileDictionary[list(self.tileDictionary.keys())[0]]:
+                raise PermissionError('Mask must be defined with readMask() before maskLevelThreshold can be defined')
+            if (maskLevelThreshold not in ['mask'] and type(tissueLevelThreshold) not in [float]):
+                raise ValueError("maskLevelThreshold must be an float")        
 
         suitableTileAddresses = []
         for tA in self.iterateTiles():
-            if tissueLevelThreshold and foregroundLevelThreshold:
-                if self.tileDictionary[tA]['tissueLevel'] >= tissueLevelThreshold:
-                    if foregroundLevelThreshold == 'otsu':
-                        if self.tileDictionary[tA]['foregroundOtsu']:
-                            suitableTileAddresses.append(tA)
-                    elif foregroundLevelThreshold == 'triangle':
-                        if self.tileDictionary[tA]['foregroundTriangle']:
-                            suitableTileAddresses.append(tA)
-                    else:
-                        if self.tileDictionary[tA]['foregroundLevel'] <= foregroundLevelThreshold:
-                            suitableTileAddresses.append(tA)
-            elif tissueLevelThreshold and not foregroundLevelThreshold:
-                if (self.tileDictionary[tA]['tissueLevel'] >= tissueLevelThreshold):
-                    suitableTileAddresses.append(tA)
-            elif foregroundLevelThreshold and not tissueLevelThreshold:
+            suitable=True
+
+            if tissueLevelThreshold:
+                if (self.tileDictionary[tA]['tissueLevel'] < tissueLevelThreshold):
+                    suitable=False
+            if foregroundLevelThreshold:
                 if foregroundLevelThreshold == 'otsu':
-                    if self.tileDictionary[tA]['foregroundOtsu']:
-                        suitableTileAddresses.append(tA)
+                    if not self.tileDictionary[tA]['foregroundOtsu']:
+                        suitable=False
                 elif foregroundLevelThreshold == 'triangle':
-                    if self.tileDictionary[tA]['foregroundTriangle']:
-                        suitableTileAddresses.append(tA)
+                    if not self.tileDictionary[tA]['foregroundTriangle']:
+                        suitable=False
                 else:
-                    if (self.tileDictionary[tA]['foregroundLevel'] <= foregroundLevelThreshold):
-                        suitableTileAddresses.append(tA)
-            else:
+                    if (self.tileDictionary[tA]['foregroundLevel'] > foregroundLevelThreshold):
+                        suitable=False
+            if maskLevelThreshold:
+                if maskLevelThreshold == 'mask':
+                    if not self.tileDictionary[tA]['mask']:
+                        suitable=False
+                else:
+                    if (self.tileDictionary[tA]['maskLevel'] < maskLevelThreshold):
+                        suitable=False
+
+            if suitable:
                 suitableTileAddresses.append(tA)
+
         return suitableTileAddresses
+
+    def slideLevelClassPrediction(self, classes, classWeights=None, method='avg'):
+        # classes: list of str
+        # classWeights: list of float in the order of classes
+        
+        foundPrediction = False
+        classPredictions={}
+        for c in classes:
+            classPredictions[c]=0
+        #evalTileCount = 0
+        for tileAddress, tileEntry in self.tileDictionary.items():
+            if 'classifierInferencePrediction' in tileEntry:
+                #evalTileCount+=1
+                tilePrediction={}
+                for c in classes:
+                    if c in tileEntry['classifierInferencePrediction']:
+                        tilePrediction[c] = tileEntry['classifierInferencePrediction'][c]
+                        foundPrediction = True
+                    else:
+                        raise ValueError(c+' not in classifierInferencePrediction')
+                if method=='max':
+                    c = max(tilePrediction, key=tilePrediction.get)
+                    classPredictions[c] += 1
+                if method=='avg':
+                    for c in classes:
+                        classPredictions[c] += tilePrediction[c]
+
+        if not foundPrediction:
+            raise ValueError('No predictions found in slide. Use inferClassifier() to generate them.')
+        
+        if classWeights:
+            for c, w in zip(classes,classWeights):
+                classPredictions[c]*=w
+        
+        classPredictions= {k: v/sum(classPredictions.values()) for k, v in classPredictions.items()}
+        
+        return max(classPredictions, key=classPredictions.get), classPredictions
+
+    def patchLevelMaxClassPrediction(self, classes):
+        # classes: list of str
+        # classWeights: list of float in the order of classes
+        foundPrediction = False
+        pred=[]
+        for tileAddress, tileEntry in self.tileDictionary.items():
+            if 'classifierInferencePrediction' in tileEntry:
+                tilePrediction={}
+                for c in classes:
+                    if c in tileEntry['classifierInferencePrediction']:
+                        tilePrediction[c] = tileEntry['classifierInferencePrediction'][c]
+                        foundPrediction = True
+                    else:
+                        raise ValueError(c+' not in classifierInferencePrediction')
+                c = max(tilePrediction, key=tilePrediction.get)
+                pred.append(c)
+
+        if not foundPrediction:
+            raise ValueError('No predictions found in slide. Use inferClassifier() to generate them.')
+
+        return pred
+
+    def patchLevelOneClassPrediction(self, oneClass):
+        # classes: list of str
+        # classWeights: list of float in the order of classes
+        foundPrediction = False
+        pred=[]
+        for tileAddress, tileEntry in self.tileDictionary.items():
+            if 'classifierInferencePrediction' in tileEntry:
+                if oneClass in tileEntry['classifierInferencePrediction']:    
+                    tilePrediction=tileEntry['classifierInferencePrediction'][oneClass]
+                    foundPrediction = True
+                else:
+                    raise ValueError(oneClass+' not in classifierInferencePrediction')
+                pred.append(tilePrediction)
+
+        if not foundPrediction:
+            raise ValueError('No predictions found in slide. Use inferClassifier() to generate them.')
+
+        return pred
 
     def visualizeClassifierInference(self, classToVisualize, fileName=False, folder=os.getcwd(), level=4):
         """A function to create an inference map image of a Slide after running
@@ -2187,6 +2482,60 @@ class Slide:
         if folder:
             os.makedirs(os.path.join(folder, id), exist_ok=True)
             plt.savefig(os.path.join(folder, id, id+"_thumbnail.png"))
+        else:
+            plt.show(block=False)
+
+    def visualizeMask(self, maskLevelThreshold, fileName=False, folder=os.getcwd(), colors=['#04F900', '#0000FE']):
+        """A function to create a map image of a Slide after running
+        :meth:`Slide.detectForeground() <pathml.slide.Slide.detectForeground>` on it. The resulting image is saved at the following
+        path: folder/fileName/fileName_foregroundLevelThreshold_thresholded_foregrounddetection.png
+
+        Args:
+            foregroundLevelThreshold (str or int, optional): applies Otsu's method to find the threshold if set to 'otsu', the triangle algorithm to find the threshold if set to 'triangle', or simply uses the tiles at or above the minimum darkness intensity threshold specified if set as an int (0 is a pure black tile, 100 is a pure white tile). Default is not to filter the tile count this way. :meth:`Slide.detectForeground() <pathml.slide.Slide.detectForeground>` must be run first.
+            fileName (str, optional): the name of the file where the foreground map image will be saved, excluding an extension. Default is self.slideFileName
+            folder (str, optional): the path to the directory where the map will be saved. Default is the current working directory.
+            colors (list, optional): a list of length two containing the color for the background followed by the color for the foreground in the map image. Colors must be defined for use in matplotlib.imshow's cmap argument. Default is a light green (#04F900) for background and a dark blue (#0000FE) for foreground.
+
+        Example:
+            pathml_slide.visualizeForeground('otsu', folder='path/to/folder')
+        """
+
+        if not self.hasTileDictionary():
+            raise PermissionError(
+                'setTileProperties must be called before inferring a classifier')
+        if maskLevelThreshold:
+            if 'maskLevel' not in self.tileDictionary[list(self.tileDictionary.keys())[0]]:
+                raise PermissionError('Mask must be defined with readMask() before maskLevelThreshold can be defined')
+
+        # get case ID
+        if fileName:
+            if type(fileName) == str:
+                id = fileName
+            else:
+                raise ValueError('fileName must be a string')
+        else:
+            id = self.slideFileName
+
+        mask = np.zeros((self.numTilesInX, self.numTilesInY)[::-1])
+
+        for tileAddress, tileEntry in self.tileDictionary.items():
+            if maskLevelThreshold == 'mask':
+                mask[tileAddress[1],tileAddress[0]] = tileEntry['mask']
+            else:
+                if tileEntry['maskLevel'] > maskLevelThreshold:
+                    mask[tileAddress[1],tileAddress[0]] = True
+                else:
+                    mask[tileAddress[1],tileAddress[0]] = False
+
+        plt.figure()
+        plt.imshow(mask, cmap=mpl.colors.ListedColormap(colors))
+        if maskLevelThreshold=='mask':
+            plt.title(self.slideFileName+"\nCustom mask")
+        else:
+            plt.title(self.slideFileName+"\nCustom mask, "+str(maskLevelThreshold)+" thresholded")
+        if folder:
+            os.makedirs(os.path.join(folder, id), exist_ok=True)
+            plt.savefig(os.path.join(folder, id, id+"_"+str(maskLevelThreshold)+"_thresholded_mask.png"))
         else:
             plt.show(block=False)
 
