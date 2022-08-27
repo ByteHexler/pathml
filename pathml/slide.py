@@ -140,15 +140,16 @@ class Slide:
         if slideFilePath[-4:] == '.pml': # setTileProperties if starting from .pml file
             self.regionWorker = pv.Region.new(self.slide)
             self.tileSize = self.tileDictionary[list(self.tileDictionary.keys())[0]]['height']
-            xs = []
-            ys = []
+            xs = set()
+            ys = set()
             for adrs in self.iterateTiles():
-                xs.append(adrs[0])
-                ys.append(adrs[1])
-            self.numTilesInX = len(list(set(xs)))
-            self.numTilesInY = len(list(set(ys)))
+                xs.add(self.tileDictionary[adrs]['x'])
+                ys.add(self.tileDictionary[adrs]['y'])
+            
+            self.numTilesInX = len(xs)
+            self.numTilesInY = len(ys)
 
-            xs.sort()
+            xs = sorted(list(xs))
             tileSize_minus_tileOverlap = xs[1]-xs[0]
             self.tileOverlap = self.tileSize - tileSize_minus_tileOverlap
 
@@ -160,6 +161,13 @@ class Slide:
         results = Parallel(n_jobs= -1, backend="threading")\
             (delayed(unwrap_self)(i) for i in tqdm(zip([self]*len(num), num), total = len(num)))
         print(results)
+
+    def thumbnail(self, level):
+        self.lowMagSlide = self.levels[level]
+        self.lowMagSlide = np.ndarray(buffer=self.lowMagSlide.write_to_memory(),
+                                        dtype=self.__format_to_dtype[self.lowMagSlide.format],
+                                        shape=[self.lowMagSlide.height, self.lowMagSlide.width, self.lowMagSlide.bands])
+        return self.lowMagSlide
 
     def levelToMemory(self, level: int):
         self.levels[level].copy_memory()
@@ -202,137 +210,6 @@ class Slide:
                                              'y': y * (self.tileSize - self.tileOverlap), 'width': self.tileSize,
                                              'height': self.tileSize}
         return self
-
-    def getNonOverlappingSegmentationInferenceArray(self, className, aggregationMethod='mean', probabilityThreshold=None, dtype='int', folder=os.getcwd(), verbose=False):#, fillUninferredPixelsWithZeros=True):
-        """A function to extract the pixel-wise inference result
-        (from :meth:`Slide.inferClassifier() <pathml.slide.Slide.inferClassifier>`) of a Slide. Tile overlap is "stitched
-        together" to produce one mask with the same pixel dimensions as the WSI.
-        The resulting mask will be saved to a .npz file as a scipy.sparse.lil_matrix.
-
-        Args:
-            className (str): the name of the class to extract the binary mask for. Must be present in the tile dictionary from :meth:`Slide.inferClassifier() <pathml.slide.Slide.inferClassifier>`.
-            aggregationMethod (str, optional): the method used to combine inference results on a pixel when two inference tiles overlap on that pixel. Default is 'mean' and no other options are currently supported.
-            probabilityThreshold (float, optional): if defined, this is used as the cutoff above which a pixel is considered part of the class className. This will result in a binary mask of Trues and Falses being created. Default is to return a mask of 0-255 int predictions.
-            dtype (str, optional): the data type to store in the output matrix. Options are 'int' for numpy.uint8 (the default), 'float' for numpy.float32. To get a Boolean output using a probability threshold, set a value for probabilityThreshold.
-            folder (str, optional): the path to the directory where the scipy.sparse.lil_matrix will be saved. Default is the current working directory.
-            verbose (Bool, optional): whether to output verbose messages. Default is False.
-
-        Example:
-            pathml_slide.getNonOverlappingSegmentationInferenceArray('metastasis', folder='path/to/folder')
-        """
-
-        if dtype == 'int':
-            inference_array = sps.lil_matrix((self.slide.height, self.slide.width), dtype=np.uint8)
-        elif dtype == 'float':
-            inference_array = sps.lil_matrix((self.slide.height, self.slide.width), dtype=np.float32)
-        else:
-            raise ValueError("dtype must be 'int' or 'float'")
-
-        # count number of times each pixel in inference tiles
-        inference_pixel_counts_array = sps.lil_matrix((self.slide.height, self.slide.width), dtype=np.uint8)
-
-        num_merged_tiles = 0
-
-        for tileAddress in self.iterateTiles():
-            if 'segmenterInferencePrediction' in self.tileDictionary[tileAddress]:
-                if className in self.tileDictionary[tileAddress]['segmenterInferencePrediction']:
-                    tile_x = self.tileDictionary[tileAddress]['x']
-                    tile_y = self.tileDictionary[tileAddress]['y']
-
-                    tile_prediction = self.tileDictionary[tileAddress]['segmenterInferencePrediction'][className]
-
-                    if dtype == 'int':
-                        if np.max(tile_prediction) <= 1:
-                            tile_prediction = tile_prediction * 255
-                            tile_prediction = tile_prediction.astype(np.uint8)
-                    if dtype == 'float':
-                        if np.max(tile_prediction) > 1:
-                            tile_prediction = tile_prediction / 255
-
-                    inference_subarray = inference_array[tile_y:tile_y+self.tileSize, tile_x:tile_x+self.tileSize]
-                    inference_subarray = inference_subarray.toarray()
-
-                    if aggregationMethod == 'mean':
-                        new_inference_subarray = inference_subarray + tile_prediction
-                    else:
-                        raise ValueError("aggregationMethod must be 'mean'")
-
-                    new_inference_subarray[inference_subarray == 0] = tile_prediction[inference_subarray == 0]
-                    new_inference_subarray = new_inference_subarray.astype(np.uint8)
-
-                    inference_array[tile_y:tile_y+self.tileSize, tile_x:tile_x+self.tileSize] = new_inference_subarray
-                    inference_pixel_counts_array[tile_y:tile_y+self.tileSize, tile_x:tile_x+self.tileSize] = inference_pixel_counts_array[tile_y:tile_y+self.tileSize, tile_x:tile_x+self.tileSize].toarray() + 1
-
-                    num_merged_tiles = num_merged_tiles + 1
-                    if verbose: print('Number of tiles merged:', num_merged_tiles)
-                else:
-                    raise ValueError(className+' not present in segmentation predictions.')
-
-        # Now take the average of each pixel for how many times it appeared
-        inference_array = sps.lil_matrix(inference_array / inference_pixel_counts_array, dtype=np.uint8)
-
-        if num_merged_tiles == 0:
-            raise ValueError('No tiles found with segmentation predictions. Run inferSegmenter() to add them.')
-
-        if probabilityThreshold:
-            # note: this gets rid of NaN and turns them into False
-            with np.errstate(invalid='ignore'):
-                if dtype == 'int':
-                    inference_array = inference_array > (probabilityThreshold * 255)
-                else:
-                    inference_array = inference_array > probabilityThreshold
-
-        sps.save_npz(os.path.join(folder, self.slideFileId+'.npz'), inference_array)
-
-    def readMask(self, maskPath, overwriteExistingMask=False):
-        if not self.hasTileDictionary():
-            raise PermissionError(
-                'setTileProperties must be called before readMask()')
-        if not overwriteExistingMask and 'maskLevel' in self.tileDictionary[list(self.tileDictionary.keys())[0]]:
-            raise Warning('Mask already detected. Use overwriteExistingMask to overwrite it.')
-        
-        # load mask
-        self.mask = np.asarray(Image.open(maskPath))/255
-        scale = (self.slide.height / self.mask.shape[0], self.slide.width / self.mask.shape[1], self.level)
-        self.readPredMap(self.mask, scale, ['maskLevel'])
-
-        return True
-
-    def detectForeground(self, level=4, mode=['foreground','otsu','triangle'], overwriteExistingForegroundDetection=False, foreground=False):
-        """A function to implement traditional foreground filtering methods on the
-        tile dictionary to exclude background tiles from subsequent operations.
-
-        Args:
-            level (int, optional): the level of the WSI pyramid to detect foreground on. Default is 4. Not all WSIs will have a 4th level, so alter if necessary. If memory runs out, increase the level to detect foreground with a less high resolution image.
-            overwriteExistingForegroundDetection (Bool, optional): whether to old foreground detection if it is present in the tile dictionary already. Default is False.
-            threshold (str or int): Legacy argument, avoid using. Default is to put the results of all tissue detection methods (Otsu, triangle, simple thresholding) in the tile dictionary. Can be set to 'otsu', 'triangle' or an int to do simple darkness thresholding at that int value (tiles with a 0-100 foregroundLevel value less or equal to than the set value are considered foreground, where 0 is a pure black tile, 100 is a pure white tile)
-
-        Example:
-            pathml_slide.detectForeground()
-        """
-        if not self.hasTileDictionary():
-            raise PermissionError(
-                'setTileProperties must be called before foreground detection')
-        if not overwriteExistingForegroundDetection and 'foregroundLevel' in self.tileDictionary[list(self.tileDictionary.keys())[0]]:
-            raise Warning('Foreground already detected. Use overwriteExistingForegroundDetection to over-write old detections.')
-
-        print(f"Detecting foreground of {self.slideFileName}")
-
-        if not self.foreground:
-            if foreground:
-                self.foreground = foreground
-            else:
-                self.foreground = Foreground(self, level)
-        
-        mode_dict = {"foreground": 0, "otsu": 1, "triangle": 2}
-        mask = [False, False, False]
-        if type(mode)==str:
-            mode = [mode]
-        for m in mode:
-            mask[mode_dict[m]] = True
-        self.readPredMap(self.foreground.map[:,:,mask], (1, 1, self.foreground.level), np.array(['foregroundLevel','otsuLevel','triangleLevel'])[mask])
-
-        return self.foreground
 
     def getTile(self, tileAddress, writeToNumpy=False, useFetch=False):
         """A function to return a desired tile in the tile dictionary in the
@@ -377,11 +254,6 @@ class Slide:
     def fetchTile(self, patchWidth, patchHeight, patchX, patchY):
         return self.regionWorker.fetch(patchX, patchY, patchWidth, patchHeight)
 
-    def ind2sub(self, tileIndex, foregroundOnly=False):
-        if foregroundOnly:
-            return self.foregroundTileAddresses[tileIndex]
-        else:
-            return np.unravel_index(tileIndex, (self.numTilesInX, self.numTilesInY), order='F')
 
     def saveTile(self, tileAddress, fileName, folder=os.getcwd()):
         """A function to save a specific tile image to an image file.
@@ -459,18 +331,15 @@ class Slide:
         else:
             id = self.slideFileId
 
-        if hasattr(self, 'rawTissueDetectionMap'):
-            if self.hasAnnotations():
-                outputDict = {'slideFilePath': self.slideFilePath, 'level':self.level, 'tileDictionary': self.tileDictionary, 'rawTissueDetectionMap': self.rawTissueDetectionMap, 'annotationClassMultiPolygons': self.annotationClassMultiPolygons}
-            else:
-                outputDict = {'slideFilePath': self.slideFilePath, 'level':self.level, 'tileDictionary': self.tileDictionary, 'rawTissueDetectionMap': self.rawTissueDetectionMap}
-        else:
-            if self.hasAnnotations():
-                outputDict = {'slideFilePath': self.slideFilePath, 'level':self.level, 'tileDictionary': self.tileDictionary, 'annotationClassMultiPolygons': self.annotationClassMultiPolygons}
-            else:
-                outputDict = {'slideFilePath': self.slideFilePath, 'level':self.level, 'tileDictionary': self.tileDictionary}
+        outputDict = {'slideFilePath': self.slideFilePath, 'level':self.level, 'tileDictionary': self.tileDictionary}
 
-        pickle.dump(outputDict, open(os.path.join(folder, id)+'.pml', 'wb'))
+        if hasattr(self, 'rawTissueDetectionMap'):
+            outputDict.update({'rawTissueDetectionMap': self.rawTissueDetectionMap})
+        if self.hasAnnotations():
+            outputDict.update({'annotationClassMultiPolygons': self.annotationClassMultiPolygons})
+        
+        with open(os.path.join(folder, id)+'.pml', 'wb') as f:
+            pickle.dump(outputDict, f)
 
     def appendTag(self, tileAddress, key, val):
         """A function to add key-value pair of data to a certain tile in the tile dictionary.
@@ -488,13 +357,6 @@ class Slide:
             raise PermissionError(
                 'setTileProperties must be called before appending tag')
         self.tileDictionary[tileAddress][key] = val
-
-    def thumbnail(self, level):
-        self.lowMagSlide = self.levels[level]
-        self.lowMagSlide = np.ndarray(buffer=self.lowMagSlide.write_to_memory(),
-                                      dtype=self.__format_to_dtype[self.lowMagSlide.format],
-                                      shape=[self.lowMagSlide.height, self.lowMagSlide.width, self.lowMagSlide.bands])
-        return self.lowMagSlide
 
     def hasTileDictionary(self):
         """A function that returns a Boolean of whether the Slide object has a
@@ -556,7 +418,71 @@ class Slide:
             else:
                 yield key
 
-    def getTileCount(self, foregroundLevelThreshold=False, tissueLevelThreshold=False, foregroundOnly=False):
+    def suitableTileAddresses(self, tissueLevelThreshold=False, foregroundLevelThreshold=False, otsuLevelThreshold=False, triangleLevelThreshold=False, maskLevelThreshold=False):
+        """A function that returns a list of the tile address tuples that meet
+        set tissue and foreground thresholds. All addresses will be returned if
+        neither tissueLevelThreshold nor foregroundLevelThreshold is defined.
+
+        Args:
+            foregroundLevelThreshold (str or int or float, optional): if defined as an int, only includes the tile address of tiles with a 0-100 foregroundLevel value less or equal to than the set value (0 is a black tile, 100 is a white tile). Only includes Otsu's method-passing tiles if set to 'otsu', or triangle algorithm-passing tiles if set to 'triangle'. Default is not to filter on foreground at all.
+            tissueLevelThreshold (int or float, optional): if defined, only includes the tile addresses of tiles with a 0 to 1 tissueLevel probability greater than or equal to the set value. Default is False.
+
+        Returns:
+            list: List of tile addresses (tuples of integers) meeting the specified conditions
+
+        Example:
+            suitable_tile_addresses = pathml_slide.suitableTileAddresses(tissueLevelThreshold=0.995, foregroundLevelThreshold=88)
+        """
+
+        if not self.hasTileDictionary():
+            raise PermissionError(
+                'setTileProperties must be called before tile counting')
+        if foregroundLevelThreshold:
+            if 'foregroundLevel' not in self.tileDictionary[list(self.tileDictionary.keys())[0]]:
+                raise PermissionError('Foreground detection must be performed with detectForeground() before foregroundLevelThreshold can be defined.')
+            if (foregroundLevelThreshold not in ['otsu', 'triangle']) and (type(foregroundLevelThreshold) not in [int, float]):
+                raise ValueError("foregroundLevelThreshold must be an int, a float, 'otsu', or 'triangle'")
+        if tissueLevelThreshold:
+            if 'tissueLevel' not in self.tileDictionary[list(self.tileDictionary.keys())[0]]:
+                raise PermissionError('Tissue detection must be performed with detectTissue() before tissueLevelThreshold can be defined.')
+            if type(tissueLevelThreshold) not in [int, float]:
+                raise ValueError("tissueLevelThreshold must be an int or float")
+        if type(maskLevelThreshold)==int or maskLevelThreshold:
+            if 'maskLevel' not in self.tileDictionary[list(self.tileDictionary.keys())[0]]:
+                raise PermissionError('Mask must be defined with readMask() before maskLevelThreshold can be defined')
+            if (maskLevelThreshold not in ['mask'] and type(tissueLevelThreshold) not in [float]):
+                raise ValueError("maskLevelThreshold must be an float")        
+
+        suitableTileAddresses = []
+        for tA in self.iterateTiles():
+            suitable=True
+
+            if tissueLevelThreshold:
+                if (self.tileDictionary[tA]['tissueLevel'] < tissueLevelThreshold):
+                    suitable=False
+            if foregroundLevelThreshold:
+                if (self.tileDictionary[tA]['foregroundLevel'] >= foregroundLevelThreshold):
+                    suitable=False
+            if otsuLevelThreshold:
+                if (self.tileDictionary[tA]['otsuLevel'] < otsuLevelThreshold):
+                    suitable=False
+            if triangleLevelThreshold:
+                if (self.tileDictionary[tA]['triangleLevel'] < triangleLevelThreshold):
+                    suitable=False
+            if maskLevelThreshold:
+                if maskLevelThreshold == 'mask':
+                    if not self.tileDictionary[tA]['mask']:
+                        suitable=False
+                else:
+                    if (self.tileDictionary[tA]['maskLevel'] < maskLevelThreshold):
+                        suitable=False
+
+            if suitable:
+                suitableTileAddresses.append(tA)
+
+        return suitableTileAddresses
+
+    def getTileCount(self, foregroundLevelThreshold=False, otsuLevelThreshold=False, triangleLevelThreshold=False, tissueLevelThreshold=False):
         """A function that returns the number of tiles in the tile dictionary.
         Arguments can be used to find the number of tiles with desired
         characteristics in the tile dictionary.
@@ -564,7 +490,6 @@ class Slide:
         Args:
             foregroundLevelThreshold (str or int, optional): returns the number of tiles considered foreground if 'otsu' or 'triangle' is used, or the number of tiles at or above the minimum threshold specified if simple average darkness intensity foreground filtering was used (0 is a pure black tile, 100 is a pure white tile). Default is not to filter the tile count this way. :meth:`Slide.detectForeground() <pathml.slide.Slide.detectForeground>` must be run first.
             tissueLevelThreshold (float, optional): returns the number of tiles at or above the deep tissue detector tissue probability specified. Default is not to filter the tile count this way. :meth:`Slide.detectTissue() <pathml.slide.Slide.detectTissue>` must be run first.
-            foregroundOnly (Bool, optional): Legacy argument, avoid using. Whether to return the count of only the number of foreground tiles found with detectForeground(). Only available if threshold argument was used when :meth:`Slide.detectForeground() <pathml.slide.Slide.detectForeground>` was called.
 
         Returns:
             int: The number of tiles in the Slide's tile dictionary
@@ -573,15 +498,7 @@ class Slide:
             pathml_slide.getTileCount()
         """
 
-        if foregroundLevelThreshold or tissueLevelThreshold:
-            return len(self.suitableTileAddresses(foregroundLevelThreshold=foregroundLevelThreshold, tissueLevelThreshold=tissueLevelThreshold))
-        elif foregroundOnly:
-            if hasattr(self, 'foregroundTileAddresses'):
-                return len(self.foregroundTileAddresses)
-            else:
-                raise PermissionError('foregroundOnly cannot be defined unless the threshold argument was used when detectForeground() was called. Note that the use of foregroundOnly is a legacy feature and not recommended.')
-        else:
-            return len(self.suitableTileAddresses(foregroundLevelThreshold=foregroundLevelThreshold, tissueLevelThreshold=tissueLevelThreshold))
+        return len(self.suitableTileAddresses(foregroundLevelThreshold=foregroundLevelThreshold, otsuLevelThreshold=otsuLevelThreshold, triangleLevelThreshold=triangleLevelThreshold, tissueLevelThreshold=tissueLevelThreshold))
 
     def addAnnotations(self, annotationFilePath, classesToAdd=False, negativeClass=False, level=0,
         overwriteExistingAnnotations=False, mergeOverlappingAnnotationsOfSameClass=True, acceptMultiPolygonAnnotations=True):
@@ -957,7 +874,7 @@ class Slide:
         return mask
 
     def extractAnnotationTiles(self, outputDir, slideName=False, numTilesToExtractPerClass='all', classesToExtract=False, otherClassNames=False,
-        extractSegmentationMasks=False, tileAnnotationOverlapThreshold=0.5, foregroundLevelThreshold=False, tissueLevelThreshold=False,
+        extractSegmentationMasks=False, tileAnnotationOverlapThreshold=0.5, foregroundLevelThreshold=False, otsuLevelThreshold=False, triangleLevelThreshold=False, tissueLevelThreshold=False,
         returnTileStats=True, returnOnlyNumTilesFromThisClass=False, seed=False):
         """A function to extract tiles that overlap with annotations into
         directory structure amenable to torch.utils.data.ConcatDataset.
@@ -1059,7 +976,7 @@ class Slide:
         # Get tiles to extract
         annotatedTileAddresses = {extractionClass: [] for extractionClass in extractionClasses}
 
-        suitable_tile_addresses = self.suitableTileAddresses(tissueLevelThreshold=tissueLevelThreshold, foregroundLevelThreshold=foregroundLevelThreshold)
+        suitable_tile_addresses = self.suitableTileAddresses(tissueLevelThreshold=tissueLevelThreshold, foregroundLevelThreshold=foregroundLevelThreshold, otsuLevelThreshold=otsuLevelThreshold, triangleLevelThreshold=triangleLevelThreshold)
         for address in suitable_tile_addresses:
             for extractionClass in extractionClasses:
                 if self.tileDictionary[address][extractionClass+'Overlap'] >= annotationOverlapThresholdDict[extractionClass]:
@@ -1249,7 +1166,7 @@ class Slide:
 
 
     def extractAnnotationTilesMultiClassSegmentation(self, outputDir, slideName=False, numTilesToExtract=100, classesToExtract=False,
-        tileAnnotationOverlapThreshold=0.5, foregroundLevelThreshold=False, tissueLevelThreshold=False, returnTileStats=True, seed=False):
+        tileAnnotationOverlapThreshold=0.5, foregroundLevelThreshold=False, otsuLevelThreshold=False, triangleLevelThreshold=False, tissueLevelThreshold=False, returnTileStats=True, seed=False):
         """A function to extract tiles that overlap with annotations and their
         corresponding segmentation masks, where annotation masks are returned as
         .npy files containing ndarray stacks (each array in the stack being one
@@ -1328,7 +1245,7 @@ class Slide:
         annotatedTileAddresses = [] #{extractionClass: [] for extractionClass in extractionClasses}
 
         # Find tile addresses where the sum of the overlap of the desired classes is at least as big as tileAnnotationOverlapThreshold
-        suitable_tile_addresses = self.suitableTileAddresses(tissueLevelThreshold=tissueLevelThreshold, foregroundLevelThreshold=foregroundLevelThreshold)
+        suitable_tile_addresses = self.suitableTileAddresses(tissueLevelThreshold=tissueLevelThreshold, foregroundLevelThreshold=foregroundLevelThreshold, otsuLevelThreshold=otsuLevelThreshold, triangleLevelThreshold=triangleLevelThreshold)
         for address in suitable_tile_addresses:
             classOverlapSum = 0
             for extractionClass in extractionClasses:
@@ -1447,7 +1364,7 @@ class Slide:
             return extractionClasses
 
     def extractRandomUnannotatedTiles(self, outputDir, slideName=False, numTilesToExtract=100, unannotatedClassName='unannotated', otherClassNames=False,
-        extractSegmentationMasks=False, foregroundLevelThreshold=False, tissueLevelThreshold=False, returnTileStats=True, seed=False):
+        extractSegmentationMasks=False, foregroundLevelThreshold=False, otsuLevelThreshold=False, triangleLevelThreshold=False, tissueLevelThreshold=False, returnTileStats=True, seed=False):
         """A function to extract randomly selected tiles that don't overlap any
         annotations into directory structure amenable to torch.utils.data.ConcatDataset
 
@@ -1506,7 +1423,7 @@ class Slide:
         # Collect all unannotated tiles
         unannotatedTileAddresses = []
 
-        suitable_tile_addresses = self.suitableTileAddresses(tissueLevelThreshold=tissueLevelThreshold, foregroundLevelThreshold=foregroundLevelThreshold)
+        suitable_tile_addresses = self.suitableTileAddresses(tissueLevelThreshold=tissueLevelThreshold, foregroundLevelThreshold=foregroundLevelThreshold, otsuLevelThreshold=otsuLevelThreshold, triangleLevelThreshold=triangleLevelThreshold)
         for address in suitable_tile_addresses:
             overlapsAnnotation = False
             for annotationClass in annotationClasses:
@@ -1811,7 +1728,7 @@ class Slide:
 
         tmpProcessor = Processor(tissueForegroundSlide)
         tissueForegroundSlide = tmpProcessor.applyModel(tissueDetector(modelStateDictPath=modelStateDictPath, architecture=architecture), batch_size=batchSize, predictionKey='tissue_detector', numWorkers=numWorkers, foregroundLevelThreshold=foregroundLevelThreshold, otsuLevelThreshold=otsuLevelThreshold, triangleLevelThreshold=triangleLevelThreshold)#.adoptKeyFromTileDictionary(upsampleFactor=tissueDetectionUpsampleFactor)
-        
+
         predictionMap = np.zeros([tissueForegroundSlide.numTilesInY, tissueForegroundSlide.numTilesInX,3])
         for address in tissueForegroundSlide.iterateTiles():
             if 'tissue_detector' in tissueForegroundSlide.tileDictionary[address]:
@@ -1826,82 +1743,7 @@ class Slide:
             self.tileDictionary[address].update({'artifactLevel': predictionMap1res[address[1], address[0]][0]})
             self.tileDictionary[address].update({'backgroundLevel': predictionMap1res[address[1], address[0]][1]})
             self.tileDictionary[address].update({'tissueLevel': predictionMap1res[address[1], address[0]][2]})
-
-    def readPredMap(self, map, scale, keys, func=None):
-        # scale: tuple of (y_scale, x_scale, level)
-        # keys: list of keys in the correct order
-
-
-        y_scale, x_scale, level = scale
-
-        y_scale = y_scale*self.levels[level].height/self.slide.height
-        x_scale = x_scale*self.levels[level].width/self.slide.width
-        
-        for tileAddress in self.iterateTiles():
-            tileXPos1 = round(self.tileDictionary[tileAddress]['x'] * x_scale)
-            tileYPos1 = round(self.tileDictionary[tileAddress]['y'] * y_scale)
-            tileXPos2 = round((self.tileDictionary[tileAddress]['x'] + self.tileDictionary[tileAddress]['width']) * x_scale)
-            tileYPos2 = round((self.tileDictionary[tileAddress]['y'] + self.tileDictionary[tileAddress]['height']) * y_scale)
-            for a, key in enumerate(keys):
-                if not np.isnan(np.nanmean(map[tileYPos1:tileYPos2, tileXPos1:tileXPos2, a])):
-                    self.tileDictionary[tileAddress].update({key: np.nanmean(map[tileYPos1:tileYPos2, tileXPos1:tileXPos2, a])})
-                    if func:
-                        func(tileAddress)
-                    
-                
-    
-    #def convertDict(self, predSlide, scale, in_keys, out_keys):
-    #    predictionMap, scale = predSlide.createPredMap(in_keys, scale, out_dim=len(out_keys))
-    #    print(predictionMap[1,1,:])
-    #    self.readPredMap(predictionMap, scale, out_keys)
-
-    def checkTissueDetection(self, tissueLevelThreshold, tissueDetectionLevel=1, batchSize=20, numWorkers=16, modelStateDictPath='../pathml/pathml/models/deep-tissue-detector_densenet_state-dict.pt', architecture='densenet'):
-        #example: pathml_slide.checkTissueDetection(tissueLevelThreshold, numWorkers=numWorkers, tissueDetectionLevel=tissueLevel, batchSize=batchSize)
-        #import copy
-
-        scale = self.slide.width/self.levels[tissueDetectionLevel].width
-        tileSize = round(self.tileSize*scale)
-        tissueForegroundSlide = Slide(self.slideFilePath, level=self.level).setTileProperties(tileSize=self.tileSize, tileOverlap=self.tileOverlap/self.tileSize)#(tileSize-self.tileSize)/tileSize)
-        tissueForegroundSlide.levels =self.levels
-        for tileAddress in tissueForegroundSlide.iterateTiles():
-            tissueForegroundSlide.tileDictionary[tileAddress]['tissueLevel'] = self.tileDictionary[tileAddress]['tissueLevel']
-            tissueForegroundSlide.tileDictionary[tileAddress]['width'] = tileSize
-            tissueForegroundSlide.tileDictionary[tileAddress]['height'] = tileSize
-            new_x = round(tissueForegroundSlide.tileDictionary[tileAddress]['x']-(tileSize-self.tileSize)/2)
-            if new_x>=0:
-                if (new_x+tileSize)<=tissueForegroundSlide.slide.width:
-                    tissueForegroundSlide.tileDictionary[tileAddress]['x'] = new_x
-                else:
-                    tissueForegroundSlide.tileDictionary[tileAddress]['x'] = tissueForegroundSlide.slide.width-tileSize
-            new_y = round(tissueForegroundSlide.tileDictionary[tileAddress]['y']-(tileSize-self.tileSize)/2)
-            if new_y>=0:
-                if (new_y+tileSize)<=tissueForegroundSlide.slide.height:
-                    tissueForegroundSlide.tileDictionary[tileAddress]['y'] = new_y
-                else:
-                    tissueForegroundSlide.tileDictionary[tileAddress]['y'] = tissueForegroundSlide.slide.height-tileSize
-        tmpProcessor = Processor(tissueForegroundSlide)
-        tissueForegroundSlide = tmpProcessor.applyModel(tissueDetector(modelStateDictPath=modelStateDictPath, architecture=architecture), batch_size=batchSize, predictionKey='tissue_detector', numWorkers=numWorkers, tissueLevelThreshold=tissueLevelThreshold)#.adoptKeyFromTileDictionary(upsampleFactor=1)
-
-        n = 0
-        map = np.zeros([self.numTilesInY, self.numTilesInX, 3])
-        #resize(self.rawTissueDetectionMap, np.zeros([self.numTilesInY, self.numTilesInX]).shape, order=0, anti_aliasing=False)
-
-        for address in tissueForegroundSlide.iterateTiles():
-            if 'tissue_detector' in tissueForegroundSlide.tileDictionary[address]:
-                if tissueForegroundSlide.tileDictionary[address]['tissue_detector'][2]<tissueLevelThreshold:
-                    #print(f"tile {address}: {tissueForegroundSlide.tileDictionary[address]['tissue_detector'][2]}<{tissueLevelThreshold}")
-                    n+=1
-                    map[address[1], address[0], 0] = 1#(tissueLevelThreshold-tissueForegroundSlide.tileDictionary[address]['tissue_detector'][2])/tissueLevelThreshold
-                else:
-                    map[address[1], address[0], 1] = 1.0
-        from skimage.morphology import square, dilation
-        map[:, :, 0] = dilation(map[:, :, 0], square(11))
-        plt.figure()
-        plt.imshow(map, cmap=mpl.colors.ListedColormap(['blue', 'red', 'yellow']))
-        plt.title('deep tissue detection errors')
-        plt.show(block=False)
-        print(n)
-
+       
 
     def detectTissueFromRawTissueDetectionMap(self, rawTissueDetectionMap, overwriteExistingTissueDetection=False):
         """Function to load a raw tissue detection map from a previous application
@@ -1921,8 +1763,9 @@ class Slide:
         if hasattr(self, 'rawTissueDetectionMap') and (not overwriteExistingTissueDetection):
             raise Warning('Tissue detection has already been performed. Use overwriteExistingTissueDetection if you wish to write over it')
 
-        predictionMap2 = np.zeros([self.numTilesInY, self.numTilesInX])
-        predictionMap1res = resize(rawTissueDetectionMap, predictionMap2.shape, order=0, anti_aliasing=False)
+        tmpSlide = Slide(self.slideFilePath, level=rawTissueDetectionMap['level']).setTileProperties(tileSize=rawTissueDetectionMap['tileSize'], tileOverlap=rawTissueDetectionMap['tileOverlap'])
+
+        predictionMap1res = self.resizePredMap(rawTissueDetectionMap['level'], tmpSlide, self)
 
         self.rawTissueDetectionMap = rawTissueDetectionMap
         self.resizedTissueDetectionMap = predictionMap1res
@@ -1932,7 +1775,164 @@ class Slide:
             self.tileDictionary[address].update({'backgroundLevel': predictionMap1res[address[1], address[0]][1]})
             self.tileDictionary[address].update({'tissueLevel': predictionMap1res[address[1], address[0]][2]})
 
-    def overlayPatches(self, tiles, level=3, fileName=False, label="", folder=False):
+    def detectForeground(self, level=4, mode=['foreground','otsu','triangle'], overwriteExistingForegroundDetection=False, foreground=False):
+        """A function to implement traditional foreground filtering methods on the
+        tile dictionary to exclude background tiles from subsequent operations.
+
+        Args:
+            level (int, optional): the level of the WSI pyramid to detect foreground on. Default is 4. Not all WSIs will have a 4th level, so alter if necessary. If memory runs out, increase the level to detect foreground with a less high resolution image.
+            overwriteExistingForegroundDetection (Bool, optional): whether to old foreground detection if it is present in the tile dictionary already. Default is False.
+            threshold (str or int): Legacy argument, avoid using. Default is to put the results of all tissue detection methods (Otsu, triangle, simple thresholding) in the tile dictionary. Can be set to 'otsu', 'triangle' or an int to do simple darkness thresholding at that int value (tiles with a 0-100 foregroundLevel value less or equal to than the set value are considered foreground, where 0 is a pure black tile, 100 is a pure white tile)
+
+        Example:
+            pathml_slide.detectForeground()
+        """
+        if not self.hasTileDictionary():
+            raise PermissionError(
+                'setTileProperties must be called before foreground detection')
+        if not overwriteExistingForegroundDetection and 'foregroundLevel' in self.tileDictionary[list(self.tileDictionary.keys())[0]]:
+            raise Warning('Foreground already detected. Use overwriteExistingForegroundDetection to over-write old detections.')
+
+        print(f"Detecting foreground of {self.slideFileName}")
+
+        if not self.foreground:
+            if foreground:
+                self.foreground = foreground
+            else:
+                self.foreground = Foreground(self, level)
+        
+        mode_dict = {"foreground": 0, "otsu": 1, "triangle": 2}
+        mask = [False, False, False]
+        if type(mode)==str:
+            mode = [mode]
+        for m in mode:
+            mask[mode_dict[m]] = True
+        self.readPredMap(self.foreground.map[:,:,mask], (1, 1, self.foreground.level), np.array(['foregroundLevel','otsuLevel','triangleLevel'])[mask])
+
+        return self.foreground
+
+    def readMask(self, maskPath, overwriteExistingMask=False, threshold=None):
+        # threshold: float between 0 and 1.0
+        if not self.hasTileDictionary():
+            raise PermissionError(
+                'setTileProperties must be called before readMask()')
+        if not overwriteExistingMask and 'maskLevel' in self.tileDictionary[list(self.tileDictionary.keys())[0]]:
+            raise Warning('Mask already detected. Use overwriteExistingMask to overwrite it.')
+        
+        # load mask
+        self.mask = np.asarray(Image.open(maskPath))/255
+        scale = (self.slide.height / self.mask.shape[0], self.slide.width / self.mask.shape[1], self.level)
+        self.readPredMap(self.mask, scale, ['maskLevel'])
+
+        return True
+
+    def readPredMap(self, map, scale, keys, func=None):
+        # scale: tuple of (y_scale, x_scale, level)
+        # keys: list of keys in the correct order
+
+        y_scale, x_scale, level = scale
+
+        y_scale = y_scale*self.levels[level].height/self.slide.height
+        x_scale = x_scale*self.levels[level].width/self.slide.width
+        
+        for tileAddress in self.iterateTiles():
+            tileXPos1 = round(self.tileDictionary[tileAddress]['x'] * x_scale)
+            tileYPos1 = round(self.tileDictionary[tileAddress]['y'] * y_scale)
+            tileXPos2 = round((self.tileDictionary[tileAddress]['x'] + self.tileDictionary[tileAddress]['width']) * x_scale)
+            tileYPos2 = round((self.tileDictionary[tileAddress]['y'] + self.tileDictionary[tileAddress]['height']) * y_scale)
+            for a, key in enumerate(keys):
+                if not np.isnan(np.nanmean(map[tileYPos1:tileYPos2, tileXPos1:tileXPos2, a])):
+                    self.tileDictionary[tileAddress].update({key: np.nanmean(map[tileYPos1:tileYPos2, tileXPos1:tileXPos2, a])})
+                    if func:
+                        func(tileAddress)
+
+    def resizePredMap(self, predictionMap, oldSlide, newSlide, scale=1/16):
+        
+        old_height = (oldSlide.tileSize - oldSlide.tileOverlap)*oldSlide.numTilesInY + oldSlide.tileOverlap
+        old_width = (oldSlide.tileSize - oldSlide.tileOverlap)*oldSlide.numTilesInX + oldSlide.tileOverlap
+        new_height = (newSlide.tileSize - newSlide.tileOverlap)*newSlide.numTilesInX + newSlide.tileOverlap
+        new_width = (newSlide.tileSize - newSlide.tileOverlap)*newSlide.numTilesInY + newSlide.tileOverlap
+
+        x_pad = (old_width/oldSlide.slide.width)/(new_height/newSlide.slide.width) - 1
+        y_pad = (old_height/oldSlide.slide.height)/(new_width/newSlide.slide.height) - 1
+
+        height = round(new_height*scale)
+        width = round(new_width*scale)
+        y_pad = round(y_pad*height)
+        x_pad = round(x_pad*width)
+        predictionMap = resize(predictionMap, (height+y_pad, width+x_pad), order=0, anti_aliasing=False) # resize_local_mean(predictionMap, (height+y_pad, width+x_pad), grid_mode=True) # 
+        predictionMap = np.pad(predictionMap, ((0,max(-y_pad,0)),(0,max(-x_pad,0)),(0,0)))
+        predictionMap = predictionMap[:height,:width, :]
+        
+        return resize_local_mean(predictionMap, (newSlide.numTilesInY,newSlide.numTilesInX), grid_mode=True) # resize(predictionMap, (self.numTilesInY,self.numTilesInX), order=0, anti_aliasing=False) # resize(predictionMap, (self.numTilesInY,self.numTilesInX), order=0, anti_aliasing=True) # 
+
+    def visualizeThumbnail(self, fileName=False, folder=False, level=3):
+        """A function to create a low-resolution image of the WSI stored in a
+        Slide.
+
+        Args:
+            fileName (str, optional): the name of the file where the deep tissue detection inference map image will be saved, excluding an extension.
+            folder (str, optional): the path to the directory where the thumbnail image will be saved; if it is not defined, then the thumbnail image will only be shown with matplotlib.pyplot and not saved.
+            level (int, optional): the level of the WSI pyramid to make the thumbnail image from. Higher numbers will result in a lower resolution thumbnail. Default is 4.
+
+        Example:
+            pathml_slide.visualizeThumbnail(folder='path/to/folder')
+        """
+
+        # get case ID
+        if fileName:
+            if type(fileName) == str:
+                id = fileName
+            else:
+                raise ValueError('fileName must be a string')
+        else:
+            id = self.slideFileId
+
+        ourNewImg = self.thumbnail(level=level)
+
+        plt.figure()
+        plt.imshow(ourNewImg)
+        plt.title(id)
+        if folder:
+            os.makedirs(os.path.join(folder, id), exist_ok=True)
+            plt.savefig(os.path.join(folder, id, id+"_thumbnail.png"))
+            plt.close()
+        else:
+            plt.show(block=False)
+
+    def visualizeDetection(self, map, label="detectionMap", colors=False, fileName=False, folder=False):
+        if not self.hasTileDictionary():
+            raise PermissionError('setTileProperties must be called before saving self')
+
+        # get case ID
+        if fileName:
+            if type(fileName) == str:
+                id = fileName
+            else:
+                raise ValueError('fileName must be a string')
+        else:
+            id = self.slideFileId
+
+        if not colors:
+            if len(map.shape)==3:
+                end = map.shape[3]
+            else:
+                end = 1
+            colors = cm.get_cmap("Set1").colors[:end]
+
+        map = resize(map, (self.numTilesInY, self.numTilesInX), order=0, anti_aliasing=False)
+
+        plt.figure()
+        plt.imshow(map, cmap=mpl.colors.ListedColormap(colors))
+        plt.title(id+"\n"+'deep tissue detection')
+        if folder:
+            os.makedirs(os.path.join(folder, id), exist_ok=True)
+            plt.savefig(os.path.join(folder, id, id+"_"+label+".png"))
+            plt.close()
+        else:
+            plt.show(block=False)
+
+    def overlayPatches(self, tiles, level=3, label="patchOverlay", fileName=False, folder=False):
         
         if not self.hasTileDictionary():
             raise PermissionError('setTileProperties must be called before saving self')
@@ -1944,7 +1944,7 @@ class Slide:
             else:
                 raise ValueError('fileName must be a string')
         else:
-            id = self.slideFileName
+            id = self.slideFileId
 
         thumb = self.thumbnail(level=level)
         tileMask = np.zeros((self.numTilesInY, self.numTilesInX))
@@ -1970,14 +1970,66 @@ class Slide:
         else:
             plt.show(block=False)
 
+    def overlayInference(self, key, classToVisualize, label='prediction', probabilityThreshold=None, fileName=False, folder=os.getcwd(), level=4):
+        """A function to create an inference map image of a Slide after running
+        :meth:`Slide.inferClassifier() <pathml.slide.Slide.inferClassifier>` on it. The resulting image is saved at the following path:
+        folder/fileName/fileName_classification_of_classToVisualize.png
 
-    def visualizeSuitablePatches(self, level=3, fileName=False, folder=False, tissueLevelThreshold=False, foregroundLevelThreshold=False, maskLevelThreshold=False):
-        self.overlayPatches(self.suitableTileAddresses(tissueLevelThreshold, foregroundLevelThreshold, maskLevelThreshold), level=level, label="suitable_patches", fileName=fileName, folder=folder)
+        Args:
+            classToVisualize (str): the class to make an inference map image for. This class must be present in the tile dictionary from :meth:`Slide.inferClassifier() <pathml.slide.Slide.inferClassifier>`.
+            fileName (str, optional): the name of the file where the classification inference map image will be saved, excluding an extension. Default is self.slideFileName
+            folder (str, optional): the path to the directory where the map will be saved. Default is the current working directory.
+            level (int, optional): the level of the WSI pyramid to make the inference map image from.
+
+        Example:
+            pathml_slide.visualizeClassifierInference("metastasis", folder="path/to/folder")
+        """
+
+        ourNewImg = self.thumbnail(level=level)
+        classMask = np.zeros((self.numTilesInY, self.numTilesInX))
+
+        foundPrediction = False
+        for tileAddress, tileEntry in self.tileDictionary.items():
+            if key in tileEntry:
+                if classToVisualize in tileEntry[key]:
+                    if key == 'segmenterInferencePrediction':
+                        classMask[tileAddress[1],tileAddress[0]] = np.mean(tileEntry['segmenterInferencePrediction'][classToVisualize])
+                    else:
+                        classMask[tileAddress[1],tileAddress[0]] = tileEntry[key][classToVisualize]
+                    foundPrediction = True
+                else:
+                    raise ValueError(classToVisualize+' not in '+key)
+
+        if not foundPrediction:
+            raise ValueError('No predictions found in slide. Use inferClassifier() or inferSegmentor() to generate them.')
+
+        # re-scale to 0-1 if dtype was set to int when calling Slide.inferClassifier()
+        if np.max(classMask) > 1:
+            classMask = classMask / 255
+
+        if probabilityThreshold:
+            classMask = (classMask >= probabilityThreshold).astype(bool)
+
+        plt.figure()
+        plt.imshow(resize(ourNewImg, classMask.shape))
+        plt.imshow(classMask, cmap='plasma', alpha=0.3, vmin=0, vmax=1.0)
+        plt.colorbar()
+        plt.title(id+"\n"+classToVisualize)
+        if folder:
+            os.makedirs(os.path.join(folder, id), exist_ok=True)
+            plt.savefig(os.path.join(folder, id, id+"_"+label+"_of_"+classToVisualize+".png"))
+            plt.close()
+        else:
+            plt.show(block=False)
+
+
+    def visualizeSuitablePatches(self, level=3, fileName=False, folder=False, tissueLevelThreshold=False, foregroundLevelThreshold=False, otsuLevelThreshold=False, triangleLevelThreshold=False, maskLevelThreshold=False):
+        self.overlayPatches(self.suitableTileAddresses(tissueLevelThreshold, foregroundLevelThreshold, otsuLevelThreshold, triangleLevelThreshold, maskLevelThreshold), level=level, label="suitable_patches", fileName=fileName, folder=folder)
    
     def visualizePatchExtraction(self, level=3, fileName=False, folder=False):
         self.overlayPatches(self.extractedTiles, level=level, label="extracted_patches", fileName=fileName, folder=folder)
 
-    def visualizeTissueDetection(self, fileName=False, folder=os.getcwd()):
+    def visualizeTissueDetection(self, fileName=False, folder=False):
         """A function to generate a 3-color tissue detection map showing where
         on a WSI the deep tissue detector applied with :meth:`Slide.detectTissue() <pathml.slide.Slide.detectTissue>` artifact
         was found (red), where background was found (green), and where tissue
@@ -1991,34 +2043,112 @@ class Slide:
         Example:
             pathml_slide.visualizeTissueDetection(folder="/path/where/tissue_detection_map_will_be_saved")
         """
-
-        if not self.hasTileDictionary():
-            raise PermissionError('setTileProperties must be called before saving self')
         if not hasattr(self, 'rawTissueDetectionMap'):
             raise PermissionError('detectTissue must be called before getting resized tissue detection map')
+        self.visualizeDetection(self.rawTissueDetectionMap['map'], label="tissuedetection", colors=['blue', 'yellow', 'red'], fileName=fileName, folder=folder)
 
-        # get case ID
-        if fileName:
-            if type(fileName) == str:
-                id = fileName
-            else:
-                raise ValueError('fileName must be a string')
-        else:
-            id = self.slideFileId
+    def visualizeForeground(self, mode='foreground', threshold=100, fileName=False, folder=False, colors=['#04F900', '#0000FE']):
+        """A function to create a map image of a Slide after running
+        :meth:`Slide.detectForeground() <pathml.slide.Slide.detectForeground>` on it. The resulting image is saved at the following
+        path: folder/fileName/fileName_foregroundLevelThreshold_thresholded_foregrounddetection.png
 
-        map = resize(self.rawTissueDetectionMap, np.zeros([self.numTilesInY, self.numTilesInX]).shape, order=0, anti_aliasing=False)
+        Args:
+            foregroundLevelThreshold (str or int, optional): applies Otsu's method to find the threshold if set to 'otsu', the triangle algorithm to find the threshold if set to 'triangle', or simply uses the tiles at or above the minimum darkness intensity threshold specified if set as an int (0 is a pure black tile, 100 is a pure white tile). Default is not to filter the tile count this way. :meth:`Slide.detectForeground() <pathml.slide.Slide.detectForeground>` must be run first.
+            fileName (str, optional): the name of the file where the foreground map image will be saved, excluding an extension. Default is self.slideFileName
+            folder (str, optional): the path to the directory where the map will be saved. Default is the current working directory.
+            colors (list, optional): a list of length two containing the color for the background followed by the color for the foreground in the map image. Colors must be defined for use in matplotlib.imshow's cmap argument. Default is a light green (#04F900) for background and a dark blue (#0000FE) for foreground.
 
-        plt.figure()
-        plt.imshow(map, cmap=mpl.colors.ListedColormap(['blue', 'yellow', 'red']))
-        plt.title(id+"\n"+'deep tissue detection')
-        if folder:
-            os.makedirs(os.path.join(folder, id), exist_ok=True)
-            plt.savefig(os.path.join(folder, id, id+"_tissuedetection.png"))
-            plt.close()
-        else:
-            plt.show(block=False)
+        Example:
+            pathml_slide.visualizeForeground('otsu', folder='path/to/folder')
+        """
 
-    def inferClassifier(self, trainedModel, classNames, dataTransforms=None, batchSize=30, numWorkers=16, foregroundLevelThreshold=False, tissueLevelThreshold=False, maskLevelThreshold=False, overwriteExistingClassifications=False):
+        if not self.hasTileDictionary():
+            raise PermissionError(
+                'setTileProperties must be called before inferring a classifier')
+        if 'foregroundLevel' not in self.tileDictionary[list(self.tileDictionary.keys())[0]]:
+            raise PermissionError('Foreground detection must be performed with detectForeground() before tissueLevelThreshold can be defined')
+
+        foregroundMask = np.zeros((self.numTilesInY, self.numTilesInX), dtype=bool)
+
+        for tileAddress, tileEntry in self.tileDictionary.items():
+            if mode == 'otsu' and tileEntry['otsuLevel'] >= threshold:
+                foregroundMask[tileAddress[1],tileAddress[0]] = True
+            elif mode == 'triangle' and tileEntry['triangleLevel'] >= threshold:
+                foregroundMask[tileAddress[1],tileAddress[0]] = True
+            elif mode == 'foreground' and tileEntry['foregroundLevel'] < threshold:
+                    foregroundMask[tileAddress[1],tileAddress[0]] = True
+        self.visualizeDetection(foregroundMask, label=mode+"_foregrounddetection", colors=colors, fileName=fileName, folder=folder)
+
+    def visualizeMask(self, maskLevelThreshold=0, fileName=False, folder=os.getcwd(), colors=['#04F900', '#0000FE']):
+        """A function to create a map image of a Slide after running
+        :meth:`Slide.detectForeground() <pathml.slide.Slide.detectForeground>` on it. The resulting image is saved at the following
+        path: folder/fileName/fileName_foregroundLevelThreshold_thresholded_foregrounddetection.png
+
+        Args:
+            foregroundLevelThreshold (str or int, optional): applies Otsu's method to find the threshold if set to 'otsu', the triangle algorithm to find the threshold if set to 'triangle', or simply uses the tiles at or above the minimum darkness intensity threshold specified if set as an int (0 is a pure black tile, 100 is a pure white tile). Default is not to filter the tile count this way. :meth:`Slide.detectForeground() <pathml.slide.Slide.detectForeground>` must be run first.
+            fileName (str, optional): the name of the file where the foreground map image will be saved, excluding an extension. Default is self.slideFileName
+            folder (str, optional): the path to the directory where the map will be saved. Default is the current working directory.
+            colors (list, optional): a list of length two containing the color for the background followed by the color for the foreground in the map image. Colors must be defined for use in matplotlib.imshow's cmap argument. Default is a light green (#04F900) for background and a dark blue (#0000FE) for foreground.
+
+        Example:
+            pathml_slide.visualizeForeground('otsu', folder='path/to/folder')
+        """
+
+        if not self.hasTileDictionary():
+            raise PermissionError(
+                'setTileProperties must be called before inferring a classifier')
+        if maskLevelThreshold:
+            if 'maskLevel' not in self.tileDictionary[list(self.tileDictionary.keys())[0]]:
+                raise PermissionError('Mask must be defined with readMask() before maskLevelThreshold can be defined')
+
+        mask = np.zeros((self.numTilesInY, self.numTilesInX), dtype=bool)
+
+        for tileAddress, tileEntry in self.tileDictionary.items():
+            if tileEntry['maskLevel'] > maskLevelThreshold:
+                mask[tileAddress[1],tileAddress[0]] = True
+
+        self.visualizeDetection(mask, label="mask", colors=colors, fileName=fileName, folder=folder)
+
+    def visualizeClassifierInference(self, classToVisualize, fileName=False, folder=False, level=3):
+        """A function to create an inference map image of a Slide after running
+        :meth:`Slide.inferClassifier() <pathml.slide.Slide.inferClassifier>` on it. The resulting image is saved at the following path:
+        folder/fileName/fileName_classification_of_classToVisualize.png
+
+        Args:
+            classToVisualize (str): the class to make an inference map image for. This class must be present in the tile dictionary from :meth:`Slide.inferClassifier() <pathml.slide.Slide.inferClassifier>`.
+            fileName (str, optional): the name of the file where the classification inference map image will be saved, excluding an extension. Default is self.slideFileName
+            folder (str, optional): the path to the directory where the map will be saved. Default is the current working directory.
+            level (int, optional): the level of the WSI pyramid to make the inference map image from.
+
+        Example:
+            pathml_slide.visualizeClassifierInference("metastasis", folder="path/to/folder")
+        """
+
+        self.overlayInference('classifierInferencePrediction', classToVisualize, label='classification', fileName=fileName, folder=folder, level=level)
+
+    def visualizeSegmenterInference(self, classToVisualize, probabilityThreshold=None, fileName=False, folder=False, level=3):
+        """A function to create an inference map image of a Slide after running
+        :meth:`Slide.inferSegmenter() <pathml.slide.Slide.inferSegmenter>` on it. Tiles are shown with the averageof the probabilities
+        of all their pixels. To get a pixel-level probability matrix, use
+        :meth:`Slide.getNonOverlappingSegmentationInferenceArray() <pathml.slide.Slide.getNonOverlappingSegmentationInferenceArray>`. The resulting image is saved
+        at the following path:
+        /folder/fileName/fileName_segmentation_of_classToVisualize.png
+
+        Args:
+            classToVisualize (str): the class to make an inference map image for. This class must be present in the tile dictionary from :meth:`Slide.inferSegmenter() <pathml.slide.Slide.inferSegmenter>`.
+            probabilityThreshold (float, optional): before plotting the map, binarize the inference matrix's predictions at this 0 to 1 probability threshold so that only pixels at or above the threshold will considered positive for the class of interest, and the others negative. Default is to plot the raw values in the inference matrix without thresholding.
+            fileName (str, optional): the name of the file where the segmentation inference map image will be saved, excluding an extension. Default is self.slideFileName
+            folder (str, optional): the path to the directory where the map will be saved. Default is the current working directory.
+            level (int, optional): the level of the WSI pyramid to make the inference map image from.
+
+        Example:
+            pathml_slide.visualizeSegmenterInference('metastasis', folder='path/to/folder')
+        """
+
+        self.overlayInference('segmenterInferencePrediction', classToVisualize, label='segmentation', fileName=fileName, folder=folder, level=level, probabilityThreshold=probabilityThreshold)
+
+
+    def inferClassifier(self, trainedModel, classNames, dataTransforms=None, batchSize=30, numWorkers=16, foregroundLevelThreshold=False, otsuLevelThreshold=False, triangleLevelThreshold=False, tissueLevelThreshold=False, maskLevelThreshold=False, overwriteExistingClassifications=False):
         """A function to infer a trained classifier on a Slide object using
         PyTorch.
 
@@ -2059,7 +2189,7 @@ class Slide:
         trainedModel.to(device).eval()
 
         pathSlideDataset = WholeSlideImageDataset(self, tissueLevelThreshold=tissueLevelThreshold,
-            foregroundLevelThreshold=foregroundLevelThreshold, maskLevelThreshold=maskLevelThreshold, transform=dataTransforms)
+            foregroundLevelThreshold=foregroundLevelThreshold, otsuLevelThreshold=otsuLevelThreshold, triangleLevelThreshold=triangleLevelThreshold, maskLevelThreshold=maskLevelThreshold, transform=dataTransforms)
 
         if 'classifierInferencePrediction' in self.tileDictionary[pathSlideDataset.suitableTileAddresses[0]]:
             if not overwriteExistingClassifications:
@@ -2091,7 +2221,7 @@ class Slide:
         else:
             raise Warning('No suitable tiles found at current tissueLevelThreshold and foregroundLevelThreshold')
 
-    def inferSegmenter(self, trainedModel, classNames, dataTransforms=None, dtype='int', batchSize=1, numWorkers=16, foregroundLevelThreshold=False, tissueLevelThreshold=False, maskLevelThreshold=False, overwriteExistingSegmentations=False):#, saveInChunksAtFolder=False):
+    def inferSegmenter(self, trainedModel, classNames, dataTransforms=None, dtype='int', batchSize=1, numWorkers=16, foregroundLevelThreshold=False, otsuLevelThreshold=False, triangleLevelThreshold=False, tissueLevelThreshold=False, maskLevelThreshold=False, overwriteExistingSegmentations=False):#, saveInChunksAtFolder=False):
         """A function to infer a trained segmentation model on a Slide object using
         PyTorch.
 
@@ -2139,7 +2269,7 @@ class Slide:
             raise ValueError('Model has '+str(trainedModel.n_classes)+' classes but only '+str(len(classNames))+' class names were provided in the classes argument')
 
         pathSlideDataset = WholeSlideImageDataset(self, tissueLevelThreshold=tissueLevelThreshold,
-            foregroundLevelThreshold=foregroundLevelThreshold, maskLevelThreshold=maskLevelThreshold, transform=dataTransforms, segmenting=True)
+            foregroundLevelThreshold=foregroundLevelThreshold, otsuLevelThreshold=otsuLevelThreshold, triangleLevelThreshold=triangleLevelThreshold, maskLevelThreshold=maskLevelThreshold, transform=dataTransforms, segmenting=True)
 
         if 'segmenterInferencePrediction' in self.tileDictionary[pathSlideDataset.suitableTileAddresses[0]]:
             if not overwriteExistingSegmentations:
@@ -2212,6 +2342,87 @@ class Slide:
         else:
             raise Warning('No suitable tiles found at current tissueLevelThreshold and foregroundLevelThreshold')
 
+    def getNonOverlappingSegmentationInferenceArray(self, className, aggregationMethod='mean', probabilityThreshold=None, dtype='int', folder=os.getcwd(), verbose=False):#, fillUninferredPixelsWithZeros=True):
+        """A function to extract the pixel-wise inference result
+        (from :meth:`Slide.inferClassifier() <pathml.slide.Slide.inferClassifier>`) of a Slide. Tile overlap is "stitched
+        together" to produce one mask with the same pixel dimensions as the WSI.
+        The resulting mask will be saved to a .npz file as a scipy.sparse.lil_matrix.
+
+        Args:
+            className (str): the name of the class to extract the binary mask for. Must be present in the tile dictionary from :meth:`Slide.inferClassifier() <pathml.slide.Slide.inferClassifier>`.
+            aggregationMethod (str, optional): the method used to combine inference results on a pixel when two inference tiles overlap on that pixel. Default is 'mean' and no other options are currently supported.
+            probabilityThreshold (float, optional): if defined, this is used as the cutoff above which a pixel is considered part of the class className. This will result in a binary mask of Trues and Falses being created. Default is to return a mask of 0-255 int predictions.
+            dtype (str, optional): the data type to store in the output matrix. Options are 'int' for numpy.uint8 (the default), 'float' for numpy.float32. To get a Boolean output using a probability threshold, set a value for probabilityThreshold.
+            folder (str, optional): the path to the directory where the scipy.sparse.lil_matrix will be saved. Default is the current working directory.
+            verbose (Bool, optional): whether to output verbose messages. Default is False.
+
+        Example:
+            pathml_slide.getNonOverlappingSegmentationInferenceArray('metastasis', folder='path/to/folder')
+        """
+
+        if dtype == 'int':
+            inference_array = sps.lil_matrix((self.slide.height, self.slide.width), dtype=np.uint8)
+        elif dtype == 'float':
+            inference_array = sps.lil_matrix((self.slide.height, self.slide.width), dtype=np.float32)
+        else:
+            raise ValueError("dtype must be 'int' or 'float'")
+
+        # count number of times each pixel in inference tiles
+        inference_pixel_counts_array = sps.lil_matrix((self.slide.height, self.slide.width), dtype=np.uint8)
+
+        num_merged_tiles = 0
+
+        for tileAddress in self.iterateTiles():
+            if 'segmenterInferencePrediction' in self.tileDictionary[tileAddress]:
+                if className in self.tileDictionary[tileAddress]['segmenterInferencePrediction']:
+                    tile_x = self.tileDictionary[tileAddress]['x']
+                    tile_y = self.tileDictionary[tileAddress]['y']
+
+                    tile_prediction = self.tileDictionary[tileAddress]['segmenterInferencePrediction'][className]
+
+                    if dtype == 'int':
+                        if np.max(tile_prediction) <= 1:
+                            tile_prediction = tile_prediction * 255
+                            tile_prediction = tile_prediction.astype(np.uint8)
+                    if dtype == 'float':
+                        if np.max(tile_prediction) > 1:
+                            tile_prediction = tile_prediction / 255
+
+                    inference_subarray = inference_array[tile_y:tile_y+self.tileSize, tile_x:tile_x+self.tileSize]
+                    inference_subarray = inference_subarray.toarray()
+
+                    if aggregationMethod == 'mean':
+                        new_inference_subarray = inference_subarray + tile_prediction
+                    else:
+                        raise ValueError("aggregationMethod must be 'mean'")
+
+                    new_inference_subarray[inference_subarray == 0] = tile_prediction[inference_subarray == 0]
+                    new_inference_subarray = new_inference_subarray.astype(np.uint8)
+
+                    inference_array[tile_y:tile_y+self.tileSize, tile_x:tile_x+self.tileSize] = new_inference_subarray
+                    inference_pixel_counts_array[tile_y:tile_y+self.tileSize, tile_x:tile_x+self.tileSize] = inference_pixel_counts_array[tile_y:tile_y+self.tileSize, tile_x:tile_x+self.tileSize].toarray() + 1
+
+                    num_merged_tiles = num_merged_tiles + 1
+                    if verbose: print('Number of tiles merged:', num_merged_tiles)
+                else:
+                    raise ValueError(className+' not present in segmentation predictions.')
+
+        # Now take the average of each pixel for how many times it appeared
+        inference_array = sps.lil_matrix(inference_array / inference_pixel_counts_array, dtype=np.uint8)
+
+        if num_merged_tiles == 0:
+            raise ValueError('No tiles found with segmentation predictions. Run inferSegmenter() to add them.')
+
+        if probabilityThreshold:
+            # note: this gets rid of NaN and turns them into False
+            with np.errstate(invalid='ignore'):
+                if dtype == 'int':
+                    inference_array = inference_array > (probabilityThreshold * 255)
+                else:
+                    inference_array = inference_array > probabilityThreshold
+
+        sps.save_npz(os.path.join(folder, self.slideFileId+'.npz'), inference_array)
+
     def getTileDiceScore(self, tileAddress, className, pixelBinarizationThreshold=0.5):
         """A function that returns the Dice coefficient by comparing the tile's
         ground truth segmentation mask from :meth:`Slide.addAnnotations() <pathml.slide.Slide.addAnnotations>` with the tile's
@@ -2245,70 +2456,6 @@ class Slide:
         ground_truth_mask = torch.div(ground_truth_mask, 255) # getAnnotationTileMask outputs 0-255 arrays, so we need to normalize to be 0-1 range
 
         return dice_coeff(binarized_prediction_mask, ground_truth_mask).item()
-
-    def suitableTileAddresses(self, tissueLevelThreshold=False, foregroundLevelThreshold=False, otsuLevelThreshold=False, triangleLevelThreshold=False, maskLevelThreshold=False):
-        """A function that returns a list of the tile address tuples that meet
-        set tissue and foreground thresholds. All addresses will be returned if
-        neither tissueLevelThreshold nor foregroundLevelThreshold is defined.
-
-        Args:
-            foregroundLevelThreshold (str or int or float, optional): if defined as an int, only includes the tile address of tiles with a 0-100 foregroundLevel value less or equal to than the set value (0 is a black tile, 100 is a white tile). Only includes Otsu's method-passing tiles if set to 'otsu', or triangle algorithm-passing tiles if set to 'triangle'. Default is not to filter on foreground at all.
-            tissueLevelThreshold (int or float, optional): if defined, only includes the tile addresses of tiles with a 0 to 1 tissueLevel probability greater than or equal to the set value. Default is False.
-
-        Returns:
-            list: List of tile addresses (tuples of integers) meeting the specified conditions
-
-        Example:
-            suitable_tile_addresses = pathml_slide.suitableTileAddresses(tissueLevelThreshold=0.995, foregroundLevelThreshold=88)
-        """
-
-        if not self.hasTileDictionary():
-            raise PermissionError(
-                'setTileProperties must be called before tile counting')
-        if foregroundLevelThreshold:
-            if 'foregroundLevel' not in self.tileDictionary[list(self.tileDictionary.keys())[0]]:
-                raise PermissionError('Foreground detection must be performed with detectForeground() before foregroundLevelThreshold can be defined.')
-            if (foregroundLevelThreshold not in ['otsu', 'triangle']) and (type(foregroundLevelThreshold) not in [int, float]):
-                raise ValueError("foregroundLevelThreshold must be an int, a float, 'otsu', or 'triangle'")
-        if tissueLevelThreshold:
-            if 'tissueLevel' not in self.tileDictionary[list(self.tileDictionary.keys())[0]]:
-                raise PermissionError('Tissue detection must be performed with detectTissue() before tissueLevelThreshold can be defined.')
-            if type(tissueLevelThreshold) not in [int, float]:
-                raise ValueError("tissueLevelThreshold must be an int or float")
-        if type(maskLevelThreshold)==int or maskLevelThreshold:
-            if 'maskLevel' not in self.tileDictionary[list(self.tileDictionary.keys())[0]]:
-                raise PermissionError('Mask must be defined with readMask() before maskLevelThreshold can be defined')
-            if (maskLevelThreshold not in ['mask'] and type(tissueLevelThreshold) not in [float]):
-                raise ValueError("maskLevelThreshold must be an float")        
-
-        suitableTileAddresses = []
-        for tA in self.iterateTiles():
-            suitable=True
-
-            if tissueLevelThreshold:
-                if (self.tileDictionary[tA]['tissueLevel'] < tissueLevelThreshold):
-                    suitable=False
-            if foregroundLevelThreshold:
-                if (self.tileDictionary[tA]['foregroundLevel'] >= foregroundLevelThreshold):
-                    suitable=False
-            if otsuLevelThreshold:
-                if (self.tileDictionary[tA]['otsuLevel'] < otsuLevelThreshold):
-                    suitable=False
-            if triangleLevelThreshold:
-                if (self.tileDictionary[tA]['triangleLevel'] < triangleLevelThreshold):
-                    suitable=False
-            if maskLevelThreshold:
-                if maskLevelThreshold == 'mask':
-                    if not self.tileDictionary[tA]['mask']:
-                        suitable=False
-                else:
-                    if (self.tileDictionary[tA]['maskLevel'] < maskLevelThreshold):
-                        suitable=False
-
-            if suitable:
-                suitableTileAddresses.append(tA)
-
-        return suitableTileAddresses
 
     def slideLevelClassPrediction(self, classes, classWeights=None, method='avg'):
         # classes: list of str
@@ -2387,260 +2534,6 @@ class Slide:
             raise ValueError('No predictions found in slide. Use inferClassifier() to generate them.')
 
         return pred
-
-    def visualizeClassifierInference(self, classToVisualize, fileName=False, folder=os.getcwd(), level=4):
-        """A function to create an inference map image of a Slide after running
-        :meth:`Slide.inferClassifier() <pathml.slide.Slide.inferClassifier>` on it. The resulting image is saved at the following path:
-        folder/fileName/fileName_classification_of_classToVisualize.png
-
-        Args:
-            classToVisualize (str): the class to make an inference map image for. This class must be present in the tile dictionary from :meth:`Slide.inferClassifier() <pathml.slide.Slide.inferClassifier>`.
-            fileName (str, optional): the name of the file where the classification inference map image will be saved, excluding an extension. Default is self.slideFileName
-            folder (str, optional): the path to the directory where the map will be saved. Default is the current working directory.
-            level (int, optional): the level of the WSI pyramid to make the inference map image from.
-
-        Example:
-            pathml_slide.visualizeClassifierInference("metastasis", folder="path/to/folder")
-        """
-
-        # get case ID
-        if fileName:
-            if type(fileName) == str:
-                id = fileName
-            else:
-                raise ValueError('fileName must be a string')
-        else:
-            id = self.slideFileId
-
-        ourNewImg = self.thumbnail(level=level)
-        classMask = np.zeros((self.numTilesInX, self.numTilesInY)[::-1])
-
-        foundPrediction = False
-        for tileAddress, tileEntry in self.tileDictionary.items():
-            if 'classifierInferencePrediction' in tileEntry:
-                if classToVisualize in tileEntry['classifierInferencePrediction']:
-                    classMask[tileAddress[1],tileAddress[0]] = tileEntry['classifierInferencePrediction'][classToVisualize]
-                    foundPrediction = True
-                else:
-                    raise ValueError(classToVisualize+' not in classifierInferencePrediction')
-            else:
-                classMask[tileAddress[1],tileAddress[0]] = 0
-        if not foundPrediction:
-            raise ValueError('No predictions found in slide. Use inferClassifier() to generate them.')
-
-        plt.figure()
-        plt.imshow(resize(ourNewImg, classMask.shape))
-        plt.imshow(classMask, cmap='plasma', alpha=0.3, vmin=0, vmax=1.0)
-        plt.colorbar()
-        plt.title(id+"\n"+classToVisualize)
-        if folder:
-            os.makedirs(os.path.join(folder, id), exist_ok=True)
-            plt.savefig(os.path.join(folder, id, id+"_classification_of_"+classToVisualize+".png"))
-            plt.close()
-        else:
-            plt.show(block=False)
-
-    def visualizeSegmenterInference(self, classToVisualize, probabilityThreshold=None, fileName=False, folder=os.getcwd(), level=4):
-        """A function to create an inference map image of a Slide after running
-        :meth:`Slide.inferSegmenter() <pathml.slide.Slide.inferSegmenter>` on it. Tiles are shown with the averageof the probabilities
-        of all their pixels. To get a pixel-level probability matrix, use
-        :meth:`Slide.getNonOverlappingSegmentationInferenceArray() <pathml.slide.Slide.getNonOverlappingSegmentationInferenceArray>`. The resulting image is saved
-        at the following path:
-        /folder/fileName/fileName_segmentation_of_classToVisualize.png
-
-        Args:
-            classToVisualize (str): the class to make an inference map image for. This class must be present in the tile dictionary from :meth:`Slide.inferSegmenter() <pathml.slide.Slide.inferSegmenter>`.
-            probabilityThreshold (float, optional): before plotting the map, binarize the inference matrix's predictions at this 0 to 1 probability threshold so that only pixels at or above the threshold will considered positive for the class of interest, and the others negative. Default is to plot the raw values in the inference matrix without thresholding.
-            fileName (str, optional): the name of the file where the segmentation inference map image will be saved, excluding an extension. Default is self.slideFileName
-            folder (str, optional): the path to the directory where the map will be saved. Default is the current working directory.
-            level (int, optional): the level of the WSI pyramid to make the inference map image from.
-
-        Example:
-            pathml_slide.visualizeSegmenterInference('metastasis', folder='path/to/folder')
-        """
-
-        # get case ID
-        if fileName:
-            if type(fileName) == str:
-                id = fileName
-            else:
-                raise ValueError('fileName must be a string')
-        else:
-            id = self.slideFileId
-
-        ourNewImg = self.thumbnail(level=level)
-        classMask = np.zeros((self.numTilesInX, self.numTilesInY)[::-1])
-
-        foundPrediction = False
-        for tileAddress, tileEntry in self.tileDictionary.items():
-            if 'segmenterInferencePrediction' in tileEntry:
-                if classToVisualize in tileEntry['segmenterInferencePrediction']:
-                    classMask[tileAddress[1],tileAddress[0]] = np.mean(tileEntry['segmenterInferencePrediction'][classToVisualize])
-                    foundPrediction = True
-                else:
-                    raise ValueError(classToVisualize+' not in segmenterInferencePrediction')
-            else:
-                classMask[tileAddress[1],tileAddress[0]] = 0
-        if not foundPrediction:
-            raise ValueError('No predictions found in slide. Use inferSegmenter() to generate them.')
-
-        # re-scale to 0-1 if dtype was set to int when calling Slide.inferClassifier()
-        if np.max(classMask) > 1:
-            classMask = classMask / 255
-
-        plt.figure()
-        plt.imshow(resize(ourNewImg, classMask.shape))
-        plt.imshow(classMask, cmap='plasma', alpha=0.3, vmin=0, vmax=1.0)
-        plt.colorbar()
-        plt.title(id+"\n"+classToVisualize)
-        if folder:
-            os.makedirs(os.path.join(folder, id), exist_ok=True)
-            plt.savefig(os.path.join(folder, id, id+"_segmentation_of_"+classToVisualize+".png"))
-            plt.close()
-        else:
-            plt.show(block=False)
-
-    def visualizeThumbnail(self, fileName=False, folder=False, level=4):
-        """A function to create a low-resolution image of the WSI stored in a
-        Slide.
-
-        Args:
-            fileName (str, optional): the name of the file where the deep tissue detection inference map image will be saved, excluding an extension.
-            folder (str, optional): the path to the directory where the thumbnail image will be saved; if it is not defined, then the thumbnail image will only be shown with matplotlib.pyplot and not saved.
-            level (int, optional): the level of the WSI pyramid to make the thumbnail image from. Higher numbers will result in a lower resolution thumbnail. Default is 4.
-
-        Example:
-            pathml_slide.visualizeThumbnail(folder='path/to/folder')
-        """
-
-        # get case ID
-        if fileName:
-            if type(fileName) == str:
-                id = fileName
-            else:
-                raise ValueError('fileName must be a string')
-        else:
-            id = self.slideFileId
-
-        ourNewImg = self.thumbnail(level=level)
-
-        plt.figure()
-        plt.imshow(ourNewImg)
-        plt.title(id)
-        if folder:
-            os.makedirs(os.path.join(folder, id), exist_ok=True)
-            plt.savefig(os.path.join(folder, id, id+"_thumbnail.png"))
-            plt.close()
-        else:
-            plt.show(block=False)
-
-    def visualizeMask(self, maskLevelThreshold, fileName=False, folder=os.getcwd(), colors=['#04F900', '#0000FE']):
-        """A function to create a map image of a Slide after running
-        :meth:`Slide.detectForeground() <pathml.slide.Slide.detectForeground>` on it. The resulting image is saved at the following
-        path: folder/fileName/fileName_foregroundLevelThreshold_thresholded_foregrounddetection.png
-
-        Args:
-            foregroundLevelThreshold (str or int, optional): applies Otsu's method to find the threshold if set to 'otsu', the triangle algorithm to find the threshold if set to 'triangle', or simply uses the tiles at or above the minimum darkness intensity threshold specified if set as an int (0 is a pure black tile, 100 is a pure white tile). Default is not to filter the tile count this way. :meth:`Slide.detectForeground() <pathml.slide.Slide.detectForeground>` must be run first.
-            fileName (str, optional): the name of the file where the foreground map image will be saved, excluding an extension. Default is self.slideFileName
-            folder (str, optional): the path to the directory where the map will be saved. Default is the current working directory.
-            colors (list, optional): a list of length two containing the color for the background followed by the color for the foreground in the map image. Colors must be defined for use in matplotlib.imshow's cmap argument. Default is a light green (#04F900) for background and a dark blue (#0000FE) for foreground.
-
-        Example:
-            pathml_slide.visualizeForeground('otsu', folder='path/to/folder')
-        """
-
-        if not self.hasTileDictionary():
-            raise PermissionError(
-                'setTileProperties must be called before inferring a classifier')
-        if maskLevelThreshold:
-            if 'maskLevel' not in self.tileDictionary[list(self.tileDictionary.keys())[0]]:
-                raise PermissionError('Mask must be defined with readMask() before maskLevelThreshold can be defined')
-
-        # get case ID
-        if fileName:
-            if type(fileName) == str:
-                id = fileName
-            else:
-                raise ValueError('fileName must be a string')
-        else:
-            id = self.slideFileId
-
-        mask = np.zeros((self.numTilesInX, self.numTilesInY)[::-1])
-
-        for tileAddress, tileEntry in self.tileDictionary.items():
-            if maskLevelThreshold == 'mask':
-                mask[tileAddress[1],tileAddress[0]] = tileEntry['mask']
-            else:
-                if tileEntry['maskLevel'] > maskLevelThreshold:
-                    mask[tileAddress[1],tileAddress[0]] = True
-                else:
-                    mask[tileAddress[1],tileAddress[0]] = False
-
-        plt.figure()
-        plt.imshow(mask, cmap=mpl.colors.ListedColormap(colors))
-        if maskLevelThreshold=='mask':
-            plt.title(self.slideFileName+"\nCustom mask")
-        else:
-            plt.title(self.slideFileName+"\nCustom mask, "+str(maskLevelThreshold)+" thresholded")
-        if folder:
-            os.makedirs(os.path.join(folder, id), exist_ok=True)
-            plt.savefig(os.path.join(folder, id, id+"_"+str(maskLevelThreshold)+"_thresholded_mask.png"))
-            plt.close()
-        else:
-            plt.show(block=False)
-
-    def visualizeForeground(self, foregroundLevelThreshold=100, fileName=False, folder=os.getcwd(), colors=['#04F900', '#0000FE']):
-        """A function to create a map image of a Slide after running
-        :meth:`Slide.detectForeground() <pathml.slide.Slide.detectForeground>` on it. The resulting image is saved at the following
-        path: folder/fileName/fileName_foregroundLevelThreshold_thresholded_foregrounddetection.png
-
-        Args:
-            foregroundLevelThreshold (str or int, optional): applies Otsu's method to find the threshold if set to 'otsu', the triangle algorithm to find the threshold if set to 'triangle', or simply uses the tiles at or above the minimum darkness intensity threshold specified if set as an int (0 is a pure black tile, 100 is a pure white tile). Default is not to filter the tile count this way. :meth:`Slide.detectForeground() <pathml.slide.Slide.detectForeground>` must be run first.
-            fileName (str, optional): the name of the file where the foreground map image will be saved, excluding an extension. Default is self.slideFileName
-            folder (str, optional): the path to the directory where the map will be saved. Default is the current working directory.
-            colors (list, optional): a list of length two containing the color for the background followed by the color for the foreground in the map image. Colors must be defined for use in matplotlib.imshow's cmap argument. Default is a light green (#04F900) for background and a dark blue (#0000FE) for foreground.
-
-        Example:
-            pathml_slide.visualizeForeground('otsu', folder='path/to/folder')
-        """
-
-        if not self.hasTileDictionary():
-            raise PermissionError(
-                'setTileProperties must be called before inferring a classifier')
-        if 'foregroundLevel' not in self.tileDictionary[list(self.tileDictionary.keys())[0]]:
-            raise PermissionError('Foreground detection must be performed with detectForeground() before tissueLevelThreshold can be defined')
-
-        # get case ID
-        if fileName:
-            if type(fileName) == str:
-                id = fileName
-            else:
-                raise ValueError('fileName must be a string')
-        else:
-            id = self.slideFileId
-
-        foregroundMask = np.zeros((self.numTilesInX, self.numTilesInY)[::-1])
-
-        for tileAddress, tileEntry in self.tileDictionary.items():
-            if foregroundLevelThreshold == 'otsu':
-                foregroundMask[tileAddress[1],tileAddress[0]] = tileEntry['foregroundOtsu']
-            elif foregroundLevelThreshold == 'triangle':
-                foregroundMask[tileAddress[1],tileAddress[0]] = tileEntry['foregroundTriangle']
-            else:
-                if tileEntry['foregroundLevel'] < foregroundLevelThreshold:
-                    foregroundMask[tileAddress[1],tileAddress[0]] = True
-                else:
-                    foregroundMask[tileAddress[1],tileAddress[0]] = False
-
-        plt.figure()
-        plt.imshow(foregroundMask, cmap=mpl.colors.ListedColormap(colors))
-        plt.title(self.slideFileName+"\n"+str(foregroundLevelThreshold)+" thresholded")
-        if folder:
-            os.makedirs(os.path.join(folder, id), exist_ok=True)
-            plt.savefig(os.path.join(folder, id, id+"_"+str(foregroundLevelThreshold)+"_thresholded_foregrounddetection.png"))
-            plt.close()
-        else:
-            plt.show(block=False)
 
     def numTilesAboveClassPredictionThreshold(self, classToThreshold, probabilityThresholds):
         """A function to return the number of tiles at or above one or a list of
@@ -2856,6 +2749,92 @@ class Slide:
             return metrics
         else:
             return metrics[0]
+
+    def checkTissueDetection(self, tissueLevelThreshold, tissueDetectionLevel=1, batchSize=20, numWorkers=16, modelStateDictPath='../pathml/pathml/models/deep-tissue-detector_densenet_state-dict.pt', architecture='densenet'):
+        #example: pathml_slide.checkTissueDetection(tissueLevelThreshold, numWorkers=numWorkers, tissueDetectionLevel=tissueLevel, batchSize=batchSize)
+        #import copy
+
+        scale = self.slide.width/self.levels[tissueDetectionLevel].width
+        tileSize = round(self.tileSize*scale)
+        tissueForegroundSlide = Slide(self.slideFilePath, level=self.level).setTileProperties(tileSize=self.tileSize, tileOverlap=self.tileOverlap/self.tileSize)#(tileSize-self.tileSize)/tileSize)
+        tissueForegroundSlide.levels =self.levels
+        for tileAddress in tissueForegroundSlide.iterateTiles():
+            tissueForegroundSlide.tileDictionary[tileAddress]['tissueLevel'] = self.tileDictionary[tileAddress]['tissueLevel']
+            tissueForegroundSlide.tileDictionary[tileAddress]['width'] = tileSize
+            tissueForegroundSlide.tileDictionary[tileAddress]['height'] = tileSize
+            new_x = round(tissueForegroundSlide.tileDictionary[tileAddress]['x']-(tileSize-self.tileSize)/2)
+            if new_x>=0:
+                if (new_x+tileSize)<=tissueForegroundSlide.slide.width:
+                    tissueForegroundSlide.tileDictionary[tileAddress]['x'] = new_x
+                else:
+                    tissueForegroundSlide.tileDictionary[tileAddress]['x'] = tissueForegroundSlide.slide.width-tileSize
+            new_y = round(tissueForegroundSlide.tileDictionary[tileAddress]['y']-(tileSize-self.tileSize)/2)
+            if new_y>=0:
+                if (new_y+tileSize)<=tissueForegroundSlide.slide.height:
+                    tissueForegroundSlide.tileDictionary[tileAddress]['y'] = new_y
+                else:
+                    tissueForegroundSlide.tileDictionary[tileAddress]['y'] = tissueForegroundSlide.slide.height-tileSize
+        tmpProcessor = Processor(tissueForegroundSlide)
+        tissueForegroundSlide = tmpProcessor.applyModel(tissueDetector(modelStateDictPath=modelStateDictPath, architecture=architecture), batch_size=batchSize, predictionKey='tissue_detector', numWorkers=numWorkers, tissueLevelThreshold=tissueLevelThreshold)#.adoptKeyFromTileDictionary(upsampleFactor=1)
+
+        n = 0
+        map = np.zeros([self.numTilesInY, self.numTilesInX, 3])
+        #resize(self.rawTissueDetectionMap, np.zeros([self.numTilesInY, self.numTilesInX]).shape, order=0, anti_aliasing=False)
+
+        for address in tissueForegroundSlide.iterateTiles():
+            if 'tissue_detector' in tissueForegroundSlide.tileDictionary[address]:
+                if tissueForegroundSlide.tileDictionary[address]['tissue_detector'][2]<tissueLevelThreshold:
+                    #print(f"tile {address}: {tissueForegroundSlide.tileDictionary[address]['tissue_detector'][2]}<{tissueLevelThreshold}")
+                    n+=1
+                    map[address[1], address[0], 0] = 1#(tissueLevelThreshold-tissueForegroundSlide.tileDictionary[address]['tissue_detector'][2])/tissueLevelThreshold
+                else:
+                    map[address[1], address[0], 1] = 1.0
+        from skimage.morphology import square, dilation
+        map[:, :, 0] = dilation(map[:, :, 0], square(11))
+        plt.figure()
+        plt.imshow(map, cmap=mpl.colors.ListedColormap(['blue', 'red', 'yellow']))
+        plt.title('deep tissue detection errors')
+        plt.show(block=False)
+        print(n)
+
+    #def createPredMap(self, keys, scale, out_dim=1):
+        
+    #    detect_height = (self.tileSize - self.tileOverlap)*self.numTilesInY + self.tileOverlap
+    #    detect_width = (self.tileSize - self.tileOverlap)*self.numTilesInX + self.tileOverlap
+
+    #    #ratio =  orig_height/orig_width
+    #    height = round(detect_height*scale)#3/self.tileSize)
+    #    width = round(detect_width*scale)#*3/self.tileSize)
+    #    scale = (height/detect_height, width/detect_width, self.level)
+    #    #predictionMap = np.zeros((height, width, len(keys),out_dim)) # resize_local_mean(predictionMap, (height+y_pad, width+x_pad), grid_mode=True) 
+    #    #overlap_count = np.zeros((height, width, len(keys),out_dim), dtype=np.uint8)
+        
+    #    predictionMap = np.zeros((height, width,  out_dim))
+    #    overlap_count = np.zeros((height, width,  out_dim), dtype=np.uint8)
+
+    #    for tileAddress in self.iterateTiles():
+    #        tileXPos1 = round(self.tileDictionary[tileAddress]['x'] * scale[1])
+    #        tileYPos1 = round(self.tileDictionary[tileAddress]['y'] * scale[0])
+    #        tileXPos2 = round((self.tileDictionary[tileAddress]['x'] + self.tileDictionary[tileAddress]['width']) * scale[1])
+    #        tileYPos2 = round((self.tileDictionary[tileAddress]['y'] + self.tileDictionary[tileAddress]['height']) * scale[0])
+            
+    #        dim = 0
+    #        for key in keys:
+    #            if key in self.tileDictionary[tileAddress]:
+
+    #            size = np.array(self.tileDictionary[tileAddress][key]).shape[-1]
+    #            overlap_count[tileYPos1:tileYPos2, tileXPos1:tileXPos2, dim:dim+size] += 1
+    #            predictionMap[tileYPos1:tileYPos2, tileXPos1:tileXPos2, dim:dim+size] = (overlap_count[tileYPos1:tileYPos2, tileXPos1:tileXPos2, dim:dim+size]-1)/overlap_count[tileYPos1:tileYPos2, tileXPos1:tileXPos2, dim:dim+size]*predictionMap[tileYPos1:tileYPos2, tileXPos1:tileXPos2, dim:dim+size]+1/overlap_count[tileYPos1:tileYPos2, tileXPos1:tileXPos2, dim:dim+size]*np.full((tileYPos2-tileYPos1, tileXPos2-tileXPos1, size), self.tileDictionary[tileAddress][key])
+    #            dim = dim+size
+
+    #        predictionMap = np.where(overlap_count==0, np.nan, predictionMap)
+
+    #    return predictionMap, scale
+
+    #def convertDict(self, predSlide, scale, in_keys, out_keys):
+    #    predictionMap, scale = predSlide.createPredMap(in_keys, scale, out_dim=len(out_keys))
+    #    print(predictionMap[1,1,:])
+    #    self.readPredMap(predictionMap, scale, out_keys)
 
 class Foreground:
     
